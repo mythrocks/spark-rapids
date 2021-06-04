@@ -99,6 +99,34 @@ class Spark311dbShims extends Spark311Shims {
             )
           }
         }).disabledByDefault("it only supports row based frame for now"),
+      GpuOverrides.exec[com.databricks.sql.execution.window.RunningWindowFunctionExec](
+        "DBricks-specific window agg exec",
+        ExecChecks(
+          (TypeSig.commonCudfTypes + TypeSig.ARRAY).nested(TypeSig.commonCudfTypes),
+          TypeSig.all),
+        (runningWindowFunctionExec, conf, p, r) => new GpuRunningWindowExecMeta(runningWindowFunctionExec, conf, p, r)/*new SparkPlanMeta[com.databricks.sql.execution.window.RunningWindowFunctionExec](runningWindowFunctionExec, conf, p, r) {
+
+          override def tagPlanForGpu(): Unit = {
+
+            try {
+              val winExpr = runningWindowFunctionExec.windowExpressionList
+              println("WinExprs: " + winExpr)
+              val partSpec = runningWindowFunctionExec.partitionSpec
+              println("PartitionSpec: " + partSpec)
+            }
+            catch
+            {
+              case ex: Exception => println("Unexpected exception " + ex.getMessage)
+            }
+            this.willNotWorkOnGpu("CALEB: Not implemented yet!")
+          }
+
+          override def convertToGpu(): GpuExec = {
+            null
+          }
+
+        }*/
+      ),
       GpuOverrides.exec[FileSourceScanExec](
         "Reading data from files, often from Hive tables",
         ExecChecks((TypeSig.commonCudfTypes + TypeSig.NULL + TypeSig.STRUCT + TypeSig.MAP +

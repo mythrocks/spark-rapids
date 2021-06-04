@@ -713,6 +713,11 @@ object ExpressionContext {
     assert(parent.isDefined, "It is expected that an aggregate function is a child of a SparkPlan")
     parent.get.wrapped match {
       case _: WindowExecBase => WindowAggExprContext
+      case agg if agg.getClass.getName.contains("RunningWindowFunctionExec") => {
+        println("CALEB: Found RunningWindowFunctionExec (2)!")
+        println("Exec: " + agg)
+        WindowAggExprContext
+      }
       case agg: BaseAggregateExec =>
         if (agg.groupingExpressions.isEmpty) {
           ReductionAggExprContext
