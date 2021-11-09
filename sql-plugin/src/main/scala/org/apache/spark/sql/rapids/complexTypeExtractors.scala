@@ -28,6 +28,7 @@ import org.apache.spark.sql.catalyst.util.{quoteIdentifier, TypeUtils}
 import org.apache.spark.sql.types.{AbstractDataType, AnyDataType, ArrayType, BooleanType, DataType, IntegralType, MapType, StructType}
 import org.apache.spark.sql.vectorized.ColumnarBatch
 import org.apache.spark.unsafe.types.UTF8String
+import ai.rapids.cudf.BinaryOp
 
 case class GpuGetStructField(child: Expression, ordinal: Int, name: Option[String] = None)
     extends ShimUnaryExpression with GpuExpression with ExtractValue with NullIntolerant {
@@ -223,8 +224,19 @@ case class GpuArrayContains(left: Expression, right: Expression)
     left.nullable || right.nullable || left.dataType.asInstanceOf[ArrayType].containsNull
   }
 
-  override def doColumnar(lhs: GpuColumnVector, rhs: GpuScalar): ColumnVector =
-    lhs.getBase.listContains(rhs.getBase)
+  override def doColumnar(lhs: GpuColumnVector, rhs: GpuScalar): ColumnVector = {
+    val contains = lhs.getBase.listContains(rhs.getBase)
+    withResource(contains) { containsCV =>
+      val containsNull = lhs.getBase.listContainsNullElements()
+      withResource(containsNull) { containsNullCV =>
+        val notContainsNull = containsNullCV.not
+        withResource(notContainsNull) { notContainsNullCV =>
+          // sparkContains is valid if cudfContains && !cudfContainsNull.
+          containsCV.mergeAndSetValidity(BinaryOp.BITWISE_AND, containsCV, notContainsNullCV)
+        }
+      }
+    }
+ }
 
   override def doColumnar(numRows: Int, lhs: GpuScalar, rhs: GpuScalar): ColumnVector =
     throw new IllegalStateException("This is not supported yet")
@@ -232,8 +244,19 @@ case class GpuArrayContains(left: Expression, right: Expression)
   override def doColumnar(lhs: GpuScalar, rhs: GpuColumnVector): ColumnVector =
     throw new IllegalStateException("This is not supported yet")
 
-  override def doColumnar(lhs: GpuColumnVector, rhs: GpuColumnVector): ColumnVector =
-    lhs.getBase.listContainsColumn(rhs.getBase)
+  override def doColumnar(lhs: GpuColumnVector, rhs: GpuColumnVector): ColumnVector = {
+    val contains = lhs.getBase.listContainsColumn(rhs.getBase)
+    withResource(contains) { containsCV =>
+      val containsNull = lhs.getBase.listContainsNullElements()
+      withResource(containsNull) { containsNullCV =>
+        val notContainsNull = containsNullCV.not
+        withResource(notContainsNull) { notContainsNullCV =>
+          // sparkContains is valid if cudfContains && !cudfContainsNull.
+          containsCV.mergeAndSetValidity(BinaryOp.BITWISE_AND, containsCV, notContainsNullCV)
+        }
+      }
+    }
+  }
 
   override def prettyName: String = "array_contains"
 }
