@@ -61,16 +61,33 @@ def test_map_entries(data_gen):
                 # in here yet, and would need some special case code for checking equality
                 'map_entries(a)'))
 
+
 @pytest.mark.parametrize('data_gen', [simple_string_to_string_map_gen], ids=idfn)
-def test_simple_get_map_value(data_gen):
+def test_get_map_value_string_keys(data_gen):
     assert_gpu_and_cpu_are_equal_collect(
-            lambda spark : unary_op_df(spark, data_gen).selectExpr(
+            lambda spark: unary_op_df(spark, data_gen).selectExpr(
                 'a["key_0"]',
                 'a["key_1"]',
                 'a[null]',
                 'a["key_9"]',
                 'a["NOT_FOUND"]',
                 'a["key_5"]'))
+
+
+integral_map_gens = [MapGen(f(nullable=False), f())
+                     for f in [ByteGen, ShortGen, IntegerGen, LongGen, FloatGen, DoubleGen]]
+
+
+@pytest.mark.parametrize('data_gen', integral_map_gens, ids=idfn)
+def test_get_map_value_integral_keys(data_gen):
+    assert_gpu_and_cpu_are_equal_collect(
+            lambda spark: unary_op_df(spark, data_gen).selectExpr(
+                'a[0]',
+                'a[1]',
+                'a[null]',
+                'a[-9]',
+                'a[999]'))
+
 
 @pytest.mark.parametrize('key_gen', [StringGen(nullable=False), IntegerGen(nullable=False), basic_struct_gen], ids=idfn)
 @pytest.mark.parametrize('value_gen', [StringGen(nullable=True), IntegerGen(nullable=True), basic_struct_gen], ids=idfn)
