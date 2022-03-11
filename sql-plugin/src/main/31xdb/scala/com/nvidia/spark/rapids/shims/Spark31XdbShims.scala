@@ -278,9 +278,9 @@ abstract class Spark31XdbShims extends Spark31XdbShimsBase with Logging {
     }),
     GpuOverrides.expr[GetMapValue](
       "Gets Value from a Map based on a key",
-      ExprChecks.binaryProject(TypeSig.STRING, TypeSig.all,
-        ("map", TypeSig.MAP.nested(TypeSig.STRING), TypeSig.MAP.nested(TypeSig.all)),
-        ("key", TypeSig.lit(TypeEnum.STRING), TypeSig.all)),
+      ExprChecks.binaryProject(TypeSig.commonCudfTypes, TypeSig.all,
+        ("map", TypeSig.MAP.nested(TypeSig.commonCudfTypes), TypeSig.MAP.nested(TypeSig.all)),
+        ("key", TypeSig.commonCudfTypes, TypeSig.all)),
       (in, conf, p, r) => new GpuGetMapValueMeta(in, conf, p, r){
         override def convertToGpu(map: Expression, key: Expression): GpuExpression =
           GpuGetMapValue(map, key, shouldFailOnElementNotExists)
