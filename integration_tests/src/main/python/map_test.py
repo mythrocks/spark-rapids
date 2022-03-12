@@ -65,7 +65,9 @@ def test_map_entries(data_gen):
 map_value_gens = [ByteGen, ShortGen, IntegerGen, LongGen, FloatGen, DoubleGen, StringGen, DateGen, TimestampGen]
 
 
-@pytest.mark.parametrize('data_gen', [MapGen(StringGen(nullable=False), value()) for value in map_value_gens], ids=idfn)
+@pytest.mark.parametrize('data_gen',
+                         [MapGen(StringGen(pattern='key_[0-9]', nullable=False), value()) for value in map_value_gens],
+                         ids=idfn)
 def test_get_map_value_string_keys(data_gen):
     assert_gpu_and_cpu_are_equal_collect(
             lambda spark: unary_op_df(spark, data_gen).selectExpr(
@@ -290,17 +292,55 @@ def test_map_get_map_value_ansi_not_fail(data_gen):
                 'a["NOT_FOUND"]'),
                 conf=ansi_enabled_conf)
 
-@pytest.mark.parametrize('data_gen', [simple_string_to_string_map_gen], ids=idfn)
-def test_simple_element_at_map(data_gen):
+
+@pytest.mark.parametrize('data_gen',
+                         [MapGen(StringGen(pattern='key_[0-9]', nullable=False), value()) for value in map_value_gens],
+                         ids=idfn)
+def test_element_at_map_string_keys(data_gen):
     assert_gpu_and_cpu_are_equal_collect(
-            lambda spark : unary_op_df(spark, data_gen).selectExpr(
+            lambda spark: unary_op_df(spark, data_gen).selectExpr(
                 'element_at(a, "key_0")',
                 'element_at(a, "key_1")',
                 'element_at(a, "null")',
                 'element_at(a, "key_9")',
                 'element_at(a, "NOT_FOUND")',
                 'element_at(a, "key_5")'),
-                conf={'spark.sql.ansi.enabled':False})
+            conf={'spark.sql.ansi.enabled': False})
+
+
+@pytest.mark.parametrize('data_gen', numeric_key_map_gens, ids=idfn)
+def test_element_at_map_numeric_keys(data_gen):
+    assert_gpu_and_cpu_are_equal_collect(
+        lambda spark: unary_op_df(spark, data_gen).selectExpr(
+            'element_at(a, 0)',
+            'element_at(a, 1)',
+            'element_at(a, null)',
+            'element_at(a, -9)',
+            'element_at(a, 999)'),
+        conf={'spark.sql.ansi.enabled': False})
+
+
+@pytest.mark.parametrize('data_gen', [MapGen(DateGen(nullable=False), value()) for value in map_value_gens], ids=idfn)
+def test_element_at_map_date_keys(data_gen):
+    assert_gpu_and_cpu_are_equal_collect(
+        lambda spark: unary_op_df(spark, data_gen).selectExpr(
+            'element_at(a, date "1997")',
+            'element_at(a, date "2022-01-01")',
+            'element_at(a, null)'),
+        conf={'spark.sql.ansi.enabled': False})
+
+
+@pytest.mark.parametrize('data_gen',
+                         [MapGen(TimestampGen(nullable=False), value()) for value in map_value_gens],
+                         ids=idfn)
+def test_element_at_map_timestamp_keys(data_gen):
+    assert_gpu_and_cpu_are_equal_collect(
+        lambda spark: unary_op_df(spark, data_gen).selectExpr(
+            'element_at(a, timestamp "1997")',
+            'element_at(a, timestamp "2022-01-01")',
+            'element_at(a, null)'),
+        conf={'spark.sql.ansi.enabled': False})
+
 
 @pytest.mark.skipif(is_before_spark_311(), reason="Only in Spark 3.1.1 + ANSI mode, map key throws on no such element")
 @pytest.mark.parametrize('data_gen', [simple_string_to_string_map_gen], ids=idfn)
