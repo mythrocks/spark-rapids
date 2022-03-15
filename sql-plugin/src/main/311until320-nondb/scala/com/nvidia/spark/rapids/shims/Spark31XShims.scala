@@ -284,7 +284,7 @@ abstract class Spark31XShims extends Spark301until320Shims with Logging {
           TypeSig.DECIMAL_128 + TypeSig.MAP).nested(),
         TypeSig.all,
         ("map", TypeSig.MAP.nested(TypeSig.commonCudfTypes), TypeSig.MAP.nested(TypeSig.all)),
-        ("key", TypeSig.commonCudfTypes, TypeSig.all)),
+        ("key", TypeSig.commonCudfTypesLit(), TypeSig.all)),
       (in, conf, p, r) => new GpuGetMapValueMeta(in, conf, p, r){
         override def convertToGpu(map: Expression, key: Expression): GpuExpression =
           GpuGetMapValue(map, key, shouldFailOnElementNotExists)
@@ -300,7 +300,7 @@ abstract class Spark31XShims extends Spark301until320Shims with Logging {
           TypeSig.MAP.nested(TypeSig.commonCudfTypes)
             .withPsNote(TypeEnum.MAP ,"If it's map, only primitive key types supported."),
           TypeSig.ARRAY.nested(TypeSig.all) + TypeSig.MAP.nested(TypeSig.all)),
-        ("index/key", (TypeSig.INT + TypeSig.commonCudfTypes)
+        ("index/key", (TypeSig.INT + TypeSig.commonCudfTypesLit())
           .withPsNote(TypeEnum.INT, "Only ints are supported as array indexes"),
           TypeSig.all)),
       (in, conf, p, r) => new BinaryExprMeta[ElementAt](in, conf, p, r) {
@@ -314,7 +314,7 @@ abstract class Spark31XShims extends Spark301until320Shims with Logging {
                   TypeSig.DECIMAL_128 + TypeSig.MAP).nested(),
                 TypeSig.all,
                 ("map", TypeSig.MAP.nested(TypeSig.commonCudfTypes), TypeSig.MAP.nested(TypeSig.all)),
-                ("key", TypeSig.commonCudfTypes, TypeSig.all))
+                ("key", TypeSig.commonCudfTypesLit(), TypeSig.all))
             case _: ArrayType =>
               // Match exactly with the checks for GetArrayItem
               ExprChecks.binaryProject(
