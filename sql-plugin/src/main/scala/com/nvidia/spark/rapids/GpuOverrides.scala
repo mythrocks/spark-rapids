@@ -2343,7 +2343,7 @@ object GpuOverrides extends Logging {
       }),
     expr[First](
       "first aggregate operator", {
-        ExprChecks.aggNotWindow(
+        ExprChecks.fullAgg(
           (TypeSig.STRUCT + TypeSig.ARRAY + TypeSig.MAP +
               TypeSig.commonCudfTypes + TypeSig.NULL + TypeSig.DECIMAL_128).nested(),
           TypeSig.all,
@@ -2362,7 +2362,7 @@ object GpuOverrides extends Logging {
       }),
     expr[Last](
       "last aggregate operator", {
-        ExprChecks.aggNotWindow(
+        ExprChecks.fullAgg(
           (TypeSig.STRUCT + TypeSig.ARRAY + TypeSig.MAP +
               TypeSig.commonCudfTypes + TypeSig.NULL + TypeSig.DECIMAL_128).nested(),
           TypeSig.all,

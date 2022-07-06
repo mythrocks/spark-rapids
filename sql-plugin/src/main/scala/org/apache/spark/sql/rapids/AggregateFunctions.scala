@@ -1482,6 +1482,7 @@ case class GpuDecimal128Average(child: Expression, dt: DecimalType)
  */
 case class GpuFirst(child: Expression, ignoreNulls: Boolean)
   extends GpuAggregateFunction
+  with GpuAggregateWindowFunction
   with GpuDeterministicFirstLastCollectShim
   with ImplicitCastInputTypes
   with Serializable {
@@ -1524,10 +1525,18 @@ case class GpuFirst(child: Expression, ignoreNulls: Boolean)
       TypeCheckSuccess
     }
   }
+
+  // GENERAL WINDOW FUNCTION
+  override lazy val windowInputProjection: Seq[Expression] = inputProjection
+  override def windowAggregation(
+      inputs: Seq[(ColumnVector, Int)]): RollingAggregationOnColumn =
+    RollingAggregation.nth(0, if (ignoreNulls) NullPolicy.EXCLUDE else NullPolicy.INCLUDE)
+                      .onColumn(inputs.head._2)
 }
 
 case class GpuLast(child: Expression, ignoreNulls: Boolean)
   extends GpuAggregateFunction
+  with GpuAggregateWindowFunction
   with GpuDeterministicFirstLastCollectShim
   with ImplicitCastInputTypes
   with Serializable {
@@ -1569,6 +1578,13 @@ case class GpuLast(child: Expression, ignoreNulls: Boolean)
       TypeCheckSuccess
     }
   }
+
+  // GENERAL WINDOW FUNCTION
+  override lazy val windowInputProjection: Seq[Expression] = inputProjection
+  override def windowAggregation(
+      inputs: Seq[(ColumnVector, Int)]): RollingAggregationOnColumn =
+    RollingAggregation.nth(-1, if (ignoreNulls) NullPolicy.EXCLUDE else NullPolicy.INCLUDE)
+                      .onColumn(inputs.head._2)
 }
 
 trait GpuCollectBase
