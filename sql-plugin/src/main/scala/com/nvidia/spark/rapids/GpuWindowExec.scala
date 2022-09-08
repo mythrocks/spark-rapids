@@ -614,6 +614,12 @@ object GroupedAggregations extends Arm {
         case DType.TIMESTAMP_DAYS => Scalar.durationFromLong(DType.DURATION_DAYS, value)
         case DType.TIMESTAMP_MICROSECONDS =>
           Scalar.durationFromLong(DType.DURATION_MICROSECONDS, value)
+        case x if x.getTypeId == DType.DTypeEnum.DECIMAL32 =>
+          Scalar.fromDecimal(x.getScale, value.toInt)
+        case x if x.getTypeId == DType.DTypeEnum.DECIMAL64 =>
+          Scalar.fromDecimal(x.getScale, value)
+        case x if x.getTypeId == DType.DTypeEnum.DECIMAL128 =>
+          Scalar.fromDecimal(x.getScale, java.math.BigInteger.valueOf(value))
         case _ => throw new RuntimeException(s"Not supported order by type, Found $orderByType")
       }
       Some(s)
