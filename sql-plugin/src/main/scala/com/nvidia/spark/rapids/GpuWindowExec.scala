@@ -601,8 +601,7 @@ object GroupedAggregations extends Arm {
     if (bound.isUnbounded) {
       None
     } else {
-      val valueLong = bound.value.right
-      val valueBigInt = bound.value.left
+      val valueLong = bound.value.right // Used for all cases except DECIMAL128.
       val s = orderByType match {
         case DType.INT8 => Scalar.fromByte(valueLong.get.toByte)
         case DType.INT16 => Scalar.fromShort(valueLong.get.toShort)
@@ -628,7 +627,8 @@ object GroupedAggregations extends Arm {
     boundary match {
     case special: GpuSpecialFrameBoundary =>
       val isUnBounded = special.isUnbounded
-      ParsedBoundary(isUnBounded, Right(special.value))
+      val isDecimal128 = orderByType.getTypeId == DType.DTypeEnum.DECIMAL128
+      ParsedBoundary(isUnBounded, if (isDecimal128) Left(special.value) else Right(special.value))
     case GpuLiteral(ci: CalendarInterval, CalendarIntervalType) =>
       // Get the total microseconds for TIMESTAMP_MICROSECONDS
       var x = TimeUnit.DAYS.toMicros(ci.days) + ci.microseconds
