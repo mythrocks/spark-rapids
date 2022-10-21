@@ -17,13 +17,16 @@
 package org.apache.spark.sql.hive.rapids
 
 import com.nvidia.spark.RapidsUDF
-import com.nvidia.spark.rapids.{DataWritingCommandRule, ExprChecks, ExprMeta, ExprRule, GpuExpression, GpuOverrides, HiveProvider, OptimizedCreateHiveTableAsSelectCommandMeta, RapidsConf, RepeatingParamCheck, TypeSig}
+import com.nvidia.spark.rapids.{DataWritingCommandRule, ExecChecks, ExecRule, ExprChecks, ExprMeta, ExprRule, GpuExec, GpuExpression, GpuOverrides, HiveProvider, OptimizedCreateHiveTableAsSelectCommandMeta, RapidsConf, RepeatingParamCheck, SparkPlanMeta, TypeSig}
 import com.nvidia.spark.rapids.GpuUserDefinedFunction.udfTypeSig
 
-import org.apache.spark.sql.catalyst.expressions.Expression
+import org.apache.spark.sql.catalyst.catalog.CatalogStorageFormat
+import org.apache.spark.sql.catalyst.expressions.{AttributeReference, Expression}
+import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.command.DataWritingCommand
 import org.apache.spark.sql.hive.{HiveGenericUDF, HiveSimpleUDF}
-import org.apache.spark.sql.hive.execution.OptimizedCreateHiveTableAsSelectCommand
+import org.apache.spark.sql.hive.execution.{HiveTableScanExec, OptimizedCreateHiveTableAsSelectCommand}
+import org.apache.spark.sql.types.{ArrayType, BinaryType, StructType}
 
 class HiveProviderImpl extends HiveProvider {
 
@@ -127,4 +130,60 @@ class HiveProviderImpl extends HiveProvider {
         })
     ).map(r => (r.getClassFor.asSubclass(classOf[Expression]), r)).toMap
   }
+
+  override def getExecs: Map[Class[_ <: SparkPlan], ExecRule[_ <: SparkPlan]] =
+    Seq(
+      GpuOverrides.exec[HiveTableScanExec](
+        desc = "Scan Exec to read Hive delimited text tables",
+        ExecChecks(
+          (TypeSig.commonCudfTypes + TypeSig.STRUCT + TypeSig.MAP + TypeSig.ARRAY +
+              TypeSig.DECIMAL_128 + TypeSig.BINARY).nested(),
+          TypeSig.all),
+        (p, conf, parent, r) => new SparkPlanMeta[HiveTableScanExec](p, conf, parent, r) {
+
+          def flagUnsupportedType(dataColumn: AttributeReference): Unit =
+            willNotWorkOnGpu(s"Column ${dataColumn.name} of type ${dataColumn.dataType} is unsupported for " +
+              s"Hive text tables. ")
+
+          def flagIfUnsupportedType(dataColumn: AttributeReference): Unit =
+            dataColumn.dataType match {
+              // Unsupported types.
+              case ArrayType(_, _) => flagUnsupportedType(dataColumn)
+              case StructType(_)   => flagUnsupportedType(dataColumn)
+              case BinaryType      => flagUnsupportedType(dataColumn)
+              case _               => // All else are supported.
+            }
+
+          def flagIfUnsupportedStorageFormat(storage: CatalogStorageFormat): Unit = {
+            val textInputFormat = "org.apache.hadoop.mapred.TextInputFormat"
+            val ignoreKeyOutputFormat = "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat"
+            val lazySimpleSerDe = "org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe"
+            if (  storage.inputFormat.getOrElse("") != textInputFormat
+               || storage.outputFormat.getOrElse("") != ignoreKeyOutputFormat
+               || storage.serde.getOrElse("") != lazySimpleSerDe)
+              {
+                willNotWorkOnGpu("Only \'^A\' separated text input is currently supported.")
+              }
+          }
+
+          override def convertToGpu(): GpuExec = {
+            throw new UnsupportedOperationException("CALEB: Not currently implemented.")
+            // GpuHiveTableScanExec(wrapped.output)
+          }
+
+          override def tagPlanForGpu(): Unit = {
+            // val catalogMetadata = wrapped.relation.tableMeta
+            val tableRelation = wrapped.relation
+
+            // Bail out for unsupported column types.
+            // tableRelation.tableMeta.schema.foreach(flagIfUnsupportedType)
+            // TODO: Use wrapped.relation.dataCols[i].dataType.
+            //  `schema` includes the partition columns.
+            tableRelation.dataCols.foreach(flagIfUnsupportedType)
+            flagIfUnsupportedStorageFormat(tableRelation.tableMeta.storage)
+
+            willNotWorkOnGpu("CALEB: Not currently implemented!")
+          }
+        })
+    ).collect { case r if r != null => (r.getClassFor.asSubclass(classOf[SparkPlan]), r) }.toMap
 }

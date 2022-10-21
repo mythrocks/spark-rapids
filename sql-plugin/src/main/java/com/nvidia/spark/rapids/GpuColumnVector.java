@@ -655,7 +655,7 @@ public class GpuColumnVector extends GpuColumnVectorBase {
    * not have any leaks.
    * @param colTypes the types of the columns that should be returned.
    */
-  public static ColumnarBatch from(Table table, DataType[] colTypes) {
+  public static ColumnarBatch from(Table table, DataType[] colTypes) { // TODO: CALEB: Use this to convert from readCSV output to ColumnarBatch.
     return from(table, colTypes, 0, table.getNumberOfColumns());
   }
 
