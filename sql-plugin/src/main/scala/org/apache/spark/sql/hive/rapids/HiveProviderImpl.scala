@@ -19,14 +19,13 @@ package org.apache.spark.sql.hive.rapids
 import com.nvidia.spark.RapidsUDF
 import com.nvidia.spark.rapids.{DataWritingCommandRule, ExecChecks, ExecRule, ExprChecks, ExprMeta, ExprRule, GpuExec, GpuExpression, GpuOverrides, HiveProvider, OptimizedCreateHiveTableAsSelectCommandMeta, RapidsConf, RepeatingParamCheck, SparkPlanMeta, TypeSig}
 import com.nvidia.spark.rapids.GpuUserDefinedFunction.udfTypeSig
-
 import org.apache.spark.sql.catalyst.catalog.CatalogStorageFormat
 import org.apache.spark.sql.catalyst.expressions.{AttributeReference, Expression}
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.command.DataWritingCommand
 import org.apache.spark.sql.hive.{HiveGenericUDF, HiveSimpleUDF}
 import org.apache.spark.sql.hive.execution.{HiveTableScanExec, OptimizedCreateHiveTableAsSelectCommand}
-import org.apache.spark.sql.types.{ArrayType, BinaryType, StructType}
+import org.apache.spark.sql.types.{ArrayType, BinaryType, MapType, StructType}
 
 class HiveProviderImpl extends HiveProvider {
 
@@ -142,14 +141,15 @@ class HiveProviderImpl extends HiveProvider {
         (p, conf, parent, r) => new SparkPlanMeta[HiveTableScanExec](p, conf, parent, r) {
 
           def flagUnsupportedType(dataColumn: AttributeReference): Unit =
-            willNotWorkOnGpu(s"Column ${dataColumn.name} of type ${dataColumn.dataType} is unsupported for " +
-              s"Hive text tables. ")
+            willNotWorkOnGpu(s"Column ${dataColumn.name} of type ${dataColumn.dataType} " +
+              s"is unsupported for Hive text tables. ")
 
           def flagIfUnsupportedType(dataColumn: AttributeReference): Unit =
             dataColumn.dataType match {
               // Unsupported types.
               case ArrayType(_, _) => flagUnsupportedType(dataColumn)
               case StructType(_)   => flagUnsupportedType(dataColumn)
+              case MapType(_,_,_)  => flagUnsupportedType(dataColumn)
               case BinaryType      => flagUnsupportedType(dataColumn)
               case _               => // All else are supported.
             }
@@ -167,8 +167,12 @@ class HiveProviderImpl extends HiveProvider {
           }
 
           override def convertToGpu(): GpuExec = {
-            throw new UnsupportedOperationException("CALEB: Not currently implemented.")
-            // GpuHiveTableScanExec(wrapped.output)
+//            if (true)
+//            throw new UnsupportedOperationException("CALEB: Not currently implemented.")
+//            else
+            GpuHiveTableScanExec(wrapped.requestedAttributes,
+                                 wrapped.relation,
+                                 wrapped.partitionPruningPred)
           }
 
           override def tagPlanForGpu(): Unit = {
@@ -179,6 +183,8 @@ class HiveProviderImpl extends HiveProvider {
             // tableRelation.tableMeta.schema.foreach(flagIfUnsupportedType)
             // TODO: Use wrapped.relation.dataCols[i].dataType.
             //  `schema` includes the partition columns.
+            // TODO: Also check that all partitions are LazySimpleSerDe based.
+            //       For first step, partitioned tables are unsupported.
             tableRelation.dataCols.foreach(flagIfUnsupportedType)
             flagIfUnsupportedStorageFormat(tableRelation.tableMeta.storage)
 

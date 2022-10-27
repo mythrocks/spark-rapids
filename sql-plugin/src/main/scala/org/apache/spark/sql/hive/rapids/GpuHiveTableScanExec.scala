@@ -16,27 +16,367 @@
 
 package org.apache.spark.sql.hive.rapids
 
-import com.nvidia.spark.rapids.GpuExec
-import com.nvidia.spark.rapids.shims.ShimSparkPlan
+import com.nvidia.spark.rapids.GpuMetric.{BUFFER_TIME, DEBUG_LEVEL, DESCRIPTION_BUFFER_TIME, DESCRIPTION_FILTER_TIME, DESCRIPTION_GPU_DECODE_TIME, DESCRIPTION_PEAK_DEVICE_MEMORY, ESSENTIAL_LEVEL, FILTER_TIME, GPU_DECODE_TIME, MODERATE_LEVEL, NUM_OUTPUT_ROWS, PEAK_DEVICE_MEMORY}
 
+import scala.collection.JavaConverters._
+import com.nvidia.spark.rapids.{CSVPartitionReader, ColumnarPartitionReaderWithPartitionValues, GpuExec, GpuMetric, GpuTextBasedPartitionReader, PartitionReaderIterator, PartitionReaderWithBytesRead, RapidsConf}
+import com.nvidia.spark.rapids.shims.{ShimFilePartitionReaderFactory, ShimSparkPlan, SparkShimImpl}
+import org.apache.hadoop.conf.Configuration
+import org.apache.hadoop.fs.{FileStatus, Path}
+import org.apache.hadoop.hive.ql.metadata.{Partition => HivePartition}
+import org.apache.hadoop.hive.ql.plan.TableDesc
+import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.rdd.RDD
+import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.analysis.CastSupport
 import org.apache.spark.sql.catalyst.catalog.HiveTableRelation
-import org.apache.spark.sql.catalyst.expressions.Attribute
-import org.apache.spark.sql.execution.SparkPlan
+import org.apache.spark.sql.catalyst.csv.CSVOptions
+import org.apache.spark.sql.catalyst.expressions.{And, Attribute, AttributeMap, AttributeReference, AttributeSet, BindReferences, Expression, Literal}
+import org.apache.spark.sql.connector.read.PartitionReader
+import org.apache.spark.sql.execution.datasources.{FilePartition, PartitionDirectory, PartitionedFile}
+import org.apache.spark.sql.execution.{ExecSubqueryExpression, PartitionedFileUtil, SparkPlan}
+import org.apache.spark.sql.hive.client.HiveClientImpl
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.types.{BooleanType, DataType, StructType}
 import org.apache.spark.sql.vectorized.ColumnarBatch
+import org.apache.spark.util.SerializableConfiguration
 
-case class GpuHiveTableScanExec(output: Seq[Attribute],
-                                hiveTableRelation: HiveTableRelation)
-  extends GpuExec with ShimSparkPlan {
+import java.net.URI
+import java.util.concurrent.TimeUnit.NANOSECONDS
+import scala.collection.immutable.HashSet
+
+case class GpuHiveTableScanExec(requestedAttributes: Seq[Attribute],
+                                hiveTableRelation: HiveTableRelation,
+                                partitionPruningPredicate: Seq[Expression])
+  extends GpuExec with ShimSparkPlan with CastSupport {
 
   override def children: Seq[SparkPlan] = Seq[SparkPlan]() // No children for text file reader.
+
+  override def producedAttributes: AttributeSet = outputSet ++
+    AttributeSet(partitionPruningPredicate.flatMap(_.references))
+
+  private val originalAttributes = AttributeMap(hiveTableRelation.output.map(a => a -> a))
+
+  override val output: Seq[Attribute] = {
+    // Retrieve the original attributes based on expression ID so that capitalization matches.
+    requestedAttributes.map(originalAttributes)
+  }
+
+  // Bind all partition key attribute references in the partition pruning predicate for later
+  // evaluation.
+  private lazy val boundPruningPred = partitionPruningPredicate.reduceLeftOption(And).map { pred =>
+    require(pred.dataType == BooleanType,
+      s"Data type of predicate $pred must be ${BooleanType.catalogString} rather than " +
+        s"${pred.dataType.catalogString}.")
+
+    BindReferences.bindReference(pred, hiveTableRelation.partitionCols)
+  }
+
+  @transient private lazy val hiveQlTable = HiveClientImpl.toHiveTable(hiveTableRelation.tableMeta)
+  @transient private lazy val tableDesc = new TableDesc(
+    hiveQlTable.getInputFormatClass,
+    hiveQlTable.getOutputFormatClass,
+    hiveQlTable.getMetadata)
+
+  // Create a local copy of hadoopConf,so that scan specific modifications should not impact
+  // other queries
+//      Note: hadoopConf is required to construct `hadoopReader`.
+//            Might not be required for spark-rapids.
+//  @transient private lazy val hadoopConf = {
+//    val c = sparkSession.sessionState.newHadoopConf()
+//     append columns ids and names before broadcast
+//    addColumnMetadataToConf(c)
+//    c
+//  }
+
+  /*
+  Note: Required to construct hadoopConf, to construct hadoopReader.
+        This might not be required for spark-rapids based reads.
+  private def addColumnMetadataToConf(hiveConf: Configuration): Unit = {
+    // Specifies needed column IDs for those non-partitioning columns.
+    val columnOrdinals = AttributeMap(hiveTableRelation.dataCols.zipWithIndex)
+    val neededColumnIDs = output.flatMap(columnOrdinals.get).map(o => o: Integer)
+    val neededColumnNames = output.filter(columnOrdinals.contains).map(_.name)
+
+    HiveShim.appendReadColumns(hiveConf, neededColumnIDs, neededColumnNames)
+
+    val deserializer = tableDesc.getDeserializerClass.getConstructor().newInstance()
+    deserializer.initialize(hiveConf, tableDesc.getProperties)
+
+    // Specifies types and object inspectors of columns to be scanned.
+    val structOI = ObjectInspectorUtils
+      .getStandardObjectInspector(
+        deserializer.getObjectInspector,
+        ObjectInspectorCopyOption.JAVA)
+      .asInstanceOf[StructObjectInspector]
+
+    val columnTypeNames = structOI
+      .getAllStructFieldRefs.asScala
+      .map(_.getFieldObjectInspector)
+      .map(TypeInfoUtils.getTypeInfoFromObjectInspector(_).getTypeName)
+      .mkString(",")
+
+    hiveConf.set(serdeConstants.LIST_COLUMN_TYPES, columnTypeNames)
+    hiveConf.set(serdeConstants.LIST_COLUMNS, hiveTableRelation.dataCols.map(_.name).mkString(","))
+  }
+  */
+
+  private def castFromString(value: String, dataType: DataType) = {
+    cast(Literal(value), dataType).eval(null)
+  }
+
+  /**
+   * Prunes partitions not involve the query plan.
+   *
+   * @param partitions All partitions of the relation.
+   * @return Partitions that are involved in the query plan.
+   */
+  private[hive] def prunePartitions(partitions: Seq[HivePartition]): Seq[HivePartition] = {
+    boundPruningPred match {
+      case None => partitions
+      case Some(shouldKeep) => partitions.filter { part =>
+        val dataTypes = hiveTableRelation.partitionCols.map(_.dataType)
+        val castedValues = part.getValues.asScala.zip(dataTypes)
+          .map { case (value, dataType) => castFromString(value, dataType) }
+
+        // Only partitioned values are needed here, since the predicate has already been bound to
+        // partition key attribute references.
+        val row = InternalRow.fromSeq(castedValues)
+        shouldKeep.eval(row).asInstanceOf[Boolean]
+      }
+    }
+  }
+
+   @transient lazy val prunedPartitions: Seq[HivePartition] = {
+    if (hiveTableRelation.prunedPartitions.nonEmpty) {
+      val hivePartitions =
+        hiveTableRelation.prunedPartitions.get.map(HiveClientImpl.toHivePartition(_, hiveQlTable))
+      if (partitionPruningPredicate.forall(!ExecSubqueryExpression.hasSubquery(_))) {
+        hivePartitions
+      } else {
+        prunePartitions(hivePartitions)
+      }
+    } else {
+      if (sparkSession.sessionState.conf.metastorePartitionPruning &&
+        partitionPruningPredicate.nonEmpty) {
+        rawPartitions
+      } else {
+        prunePartitions(rawPartitions)
+      }
+    }
+  }
+
+  // exposed for tests
+  @transient lazy val rawPartitions: Seq[HivePartition] = {
+    val prunedPartitions =
+      if (sparkSession.sessionState.conf.metastorePartitionPruning &&
+        partitionPruningPredicate.nonEmpty) {
+        // Retrieve the original attributes based on expression ID so that capitalization matches.
+        val normalizedFilters = partitionPruningPredicate.map(_.transform {
+          case a: AttributeReference => originalAttributes(a)
+        })
+        sparkSession.sessionState.catalog
+          .listPartitionsByFilter(hiveTableRelation.tableMeta.identifier, normalizedFilters)
+      } else {
+        sparkSession.sessionState.catalog.listPartitions(hiveTableRelation.tableMeta.identifier)
+      }
+    prunedPartitions.map(HiveClientImpl.toHivePartition(_, hiveQlTable))
+  }
 
   override protected def doExecute(): RDD[InternalRow] =
     throw new IllegalStateException(s"Row-based execution should not occur for $this")
 
+  override val additionalMetrics: Map[String, GpuMetric] = Map(
+    "numFiles" -> createMetric(ESSENTIAL_LEVEL, "number of files read"),
+    "metadataTime" -> createTimingMetric(ESSENTIAL_LEVEL, "metadata time"),
+    "filesSize" -> createSizeMetric(ESSENTIAL_LEVEL, "size of files read"),
+    GPU_DECODE_TIME -> createNanoTimingMetric(MODERATE_LEVEL, DESCRIPTION_GPU_DECODE_TIME),
+    BUFFER_TIME -> createNanoTimingMetric(MODERATE_LEVEL, DESCRIPTION_BUFFER_TIME),
+    FILTER_TIME -> createNanoTimingMetric(DEBUG_LEVEL, DESCRIPTION_FILTER_TIME),
+    PEAK_DEVICE_MEMORY -> createSizeMetric(MODERATE_LEVEL, DESCRIPTION_PEAK_DEVICE_MEMORY)
+  )
+
+  private def buildReader(sqlConf: SQLConf,
+                          broadcastConf: Broadcast[SerializableConfiguration],
+                          rapidsConf: RapidsConf,
+                          dataSchema: StructType,
+                          partitionSchema: StructType,
+                          readSchema: StructType,
+                          options: Map[String, String]
+              ): PartitionedFile => Iterator[InternalRow] = {
+    val readerFactory = GpuHiveTextPartitionReaderFactory(
+      sqlConf = sqlConf,
+      broadcastConf = broadcastConf,
+      dataSchema = dataSchema,
+      partitionSchema = partitionSchema,
+      readSchema = readSchema,
+      maxReaderBatchSizeRows = rapidsConf.maxReadBatchSizeRows,
+      maxReaderBatchSizeBytes = rapidsConf.maxReadBatchSizeBytes,
+      metrics = allMetrics,
+      options = options
+    )
+
+    PartitionReaderIterator.buildReader(readerFactory)
+  }
+
+  private def getReadSchema(tableSchema: StructType,
+                            requestedAttributes: Seq[Attribute]): StructType = {
+    // TODO: Should this filter out partition fields? Handle later?
+    val requestedSet: HashSet[String] = HashSet() ++ requestedAttributes.map(_.name)
+    val filteredFields = tableSchema.filter(f => requestedSet.contains(f.name))
+    StructType(filteredFields)
+  }
+
+  private def createReadRDDForTable(
+                readFile: PartitionedFile => Iterator[InternalRow],
+                hiveTableRelation: HiveTableRelation,
+                readSchema: StructType,
+                sparkSession: SparkSession,
+                hadoopConf: Configuration
+              ) = {
+    val tableLocation: URI = hiveTableRelation.tableMeta.storage.locationUri.getOrElse{
+      throw new UnsupportedOperationException("Table path not found")
+    }
+
+    val tablePath = new Path(tableLocation)
+    val fs        = tablePath.getFileSystem(hadoopConf)
+
+    def isNonEmptyDataFile(f: FileStatus) = {
+      if (!f.isFile || f.getLen == 0) {
+        false
+      }
+      else {
+        val name = f.getPath.getName
+        !((name.startsWith("_") && !name.contains("=")) || name.startsWith("."))
+      }
+    }
+
+    val dirContents = fs.listStatus(tablePath).filter(isNonEmptyDataFile)
+    val partitionDirectory = PartitionDirectory(InternalRow.empty, dirContents)
+    val maxSplitBytes = FilePartition.maxSplitBytes(sparkSession, Array(partitionDirectory))
+
+    val splitFiles = dirContents.flatMap { f =>
+      PartitionedFileUtil.splitFiles(
+        sparkSession,
+        f,
+        f.getPath,
+        isSplitable = true,
+        maxSplitBytes,
+        partitionDirectory.values
+      )
+    }.sortBy(_.length)(implicitly[Ordering[Long]].reverse)
+
+    val filePartitions = FilePartition.getFilePartitions(sparkSession, splitFiles, maxSplitBytes)
+
+    // TODO: Assuming per-file reading.
+    SparkShimImpl.getFileScanRDD(sparkSession, readFile, filePartitions, readSchema)
+  }
+
+  lazy val inputRDD: RDD[InternalRow] = {
+    // Assume Delimited text.
+    // TODO: Check if `options` is required.
+    val options             = hiveTableRelation.tableMeta.properties ++
+                              hiveTableRelation.tableMeta.storage.properties
+    val hadoopConf          = sparkSession.sessionState.newHadoopConfWithOptions(options)
+    val broadcastHadoopConf = sparkSession.sparkContext.broadcast(
+                                new SerializableConfiguration(hadoopConf))
+    val sqlConf             = sparkSession.sessionState.conf
+    val rapidsConf          = new RapidsConf(sqlConf)
+    val readSchema          = getReadSchema(hiveTableRelation.tableMeta.schema,
+                                            requestedAttributes)
+
+    val reader = buildReader(sqlConf,
+                             broadcastHadoopConf,
+                             rapidsConf,
+                             hiveTableRelation.tableMeta.dataSchema,
+                             hiveTableRelation.tableMeta.partitionSchema,
+                             readSchema,
+                             options)
+    // TODO: sendDriverMetrics()
+    createReadRDDForTable(reader, hiveTableRelation, readSchema, sparkSession, hadoopConf)
+  }
+
   override protected def doExecuteColumnar(): RDD[ColumnarBatch] = {
   //    GpuColumnVector.from( returned_table_from_readCSV, read_schema)
+    if (hiveTableRelation.isPartitioned) {
+      throw new UnsupportedOperationException("Partitioned Hive text tables currently unsupported.")
+    }
+    val numOutputRows = gpuLongMetric(NUM_OUTPUT_ROWS)
+    val scanTime = gpuLongMetric("scanTime")
+    inputRDD.asInstanceOf[RDD[ColumnarBatch]].mapPartitionsInternal { batches =>
+      new Iterator[ColumnarBatch] {
+
+        override def hasNext: Boolean = {
+          // The `FileScanRDD` returns an iterator which scans the file during the `hasNext` call.
+          val startNs = System.nanoTime()
+          val res = batches.hasNext
+          scanTime += NANOSECONDS.toMillis(System.nanoTime() - startNs)
+          res
+        }
+
+        override def next(): ColumnarBatch = {
+          val batch = batches.next()
+          numOutputRows += batch.numRows()
+          batch
+        }
+      }
+    }
+
     null
+  }
+}
+
+// Factory to build the columnar reader.
+case class GpuHiveTextPartitionReaderFactory(
+    sqlConf: SQLConf,
+    broadcastConf: Broadcast[SerializableConfiguration],
+    dataSchema: StructType,
+    partitionSchema: StructType,
+    readSchema: StructType,
+    maxReaderBatchSizeRows: Integer,
+    maxReaderBatchSizeBytes: Long,
+    metrics: Map[String, GpuMetric],
+    @transient options: Map[String, String])
+  extends ShimFilePartitionReaderFactory(options) {
+
+  override def buildReader(partitionedFile: PartitionedFile): PartitionReader[InternalRow] = {
+    throw new IllegalStateException("Row-based text parsing is not supported on GPU.")
+  }
+
+  override def buildColumnarReader(partFile: PartitionedFile): PartitionReader[ColumnarBatch] = {
+    val conf = broadcastConf.value.value
+    val reader = new PartitionReaderWithBytesRead(
+                   new GpuHiveDelimitedTextPartitionReader(
+                     conf, sqlConf, partFile, dataSchema,
+                     readSchema, options, maxReaderBatchSizeRows,
+                     maxReaderBatchSizeBytes, metrics))
+    ColumnarPartitionReaderWithPartitionValues.newReader(partFile, reader, partitionSchema)
+  }
+}
+
+// Reader that converts from chunked data buffers into cudf.Table.
+class GpuHiveDelimitedTextPartitionReader(
+    conf: Configuration,
+    sqlConf: SQLConf,
+    partFile: PartitionedFile,
+    dataSchema: StructType,
+    readDataSchema: StructType,
+    options: Map[String, String],
+    maxRowsPerChunk: Integer,
+    maxBytesPerChunk: Long,
+    execMetrics: Map[String, GpuMetric]) extends
+  CSVPartitionReader(conf, partFile, dataSchema, readDataSchema,
+                     new CSVOptions(options,
+                                    sqlConf.csvColumnPruning,
+                                    sqlConf.sessionLocalTimeZone,
+                                    sqlConf.columnNameOfCorruptRecord),
+                     maxRowsPerChunk, maxBytesPerChunk, execMetrics) {
+
+  override def buildCsvOptions(parsedOptions: CSVOptions,
+                               schema: StructType,
+                               hasHeader: Boolean): ai.rapids.cudf.CSVOptions.Builder = {
+    super.buildCsvOptions(parsedOptions, schema, hasHeader)
+      .withDelim('\u0001')
   }
 }
