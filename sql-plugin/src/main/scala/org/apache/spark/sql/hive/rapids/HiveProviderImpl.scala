@@ -188,7 +188,9 @@ class HiveProviderImpl extends HiveProvider {
             tableRelation.dataCols.foreach(flagIfUnsupportedType)
             flagIfUnsupportedStorageFormat(tableRelation.tableMeta.storage)
 
-            willNotWorkOnGpu("CALEB: Not currently implemented!")
+            if (tableRelation.isPartitioned) {
+              willNotWorkOnGpu("CALEB: Partitioned tables not currently supported.")
+            }
           }
         })
     ).collect { case r if r != null => (r.getClassFor.asSubclass(classOf[SparkPlan]), r) }.toMap

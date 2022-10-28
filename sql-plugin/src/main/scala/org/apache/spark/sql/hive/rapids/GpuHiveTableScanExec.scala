@@ -16,10 +16,11 @@
 
 package org.apache.spark.sql.hive.rapids
 
+import ai.rapids.cudf.{HostMemoryBuffer, Schema, Table}
 import com.nvidia.spark.rapids.GpuMetric.{BUFFER_TIME, DEBUG_LEVEL, DESCRIPTION_BUFFER_TIME, DESCRIPTION_FILTER_TIME, DESCRIPTION_GPU_DECODE_TIME, DESCRIPTION_PEAK_DEVICE_MEMORY, ESSENTIAL_LEVEL, FILTER_TIME, GPU_DECODE_TIME, MODERATE_LEVEL, NUM_OUTPUT_ROWS, PEAK_DEVICE_MEMORY}
 
 import scala.collection.JavaConverters._
-import com.nvidia.spark.rapids.{CSVPartitionReader, ColumnarPartitionReaderWithPartitionValues, GpuExec, GpuMetric, GpuTextBasedPartitionReader, PartitionReaderIterator, PartitionReaderWithBytesRead, RapidsConf}
+import com.nvidia.spark.rapids.{CSVPartitionReader, ColumnarPartitionReaderWithPartitionValues, GpuColumnVector, GpuExec, GpuMetric, PartitionReaderIterator, PartitionReaderWithBytesRead, RapidsConf}
 import com.nvidia.spark.rapids.shims.{ShimFilePartitionReaderFactory, ShimSparkPlan, SparkShimImpl}
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileStatus, Path}
@@ -35,7 +36,7 @@ import org.apache.spark.sql.catalyst.csv.CSVOptions
 import org.apache.spark.sql.catalyst.expressions.{And, Attribute, AttributeMap, AttributeReference, AttributeSet, BindReferences, Expression, Literal}
 import org.apache.spark.sql.connector.read.PartitionReader
 import org.apache.spark.sql.execution.datasources.{FilePartition, PartitionDirectory, PartitionedFile}
-import org.apache.spark.sql.execution.{ExecSubqueryExpression, PartitionedFileUtil, SparkPlan}
+import org.apache.spark.sql.execution.{ExecSubqueryExpression, LeafExecNode, PartitionedFileUtil}
 import org.apache.spark.sql.hive.client.HiveClientImpl
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{BooleanType, DataType, StructType}
@@ -49,9 +50,10 @@ import scala.collection.immutable.HashSet
 case class GpuHiveTableScanExec(requestedAttributes: Seq[Attribute],
                                 hiveTableRelation: HiveTableRelation,
                                 partitionPruningPredicate: Seq[Expression])
-  extends GpuExec with ShimSparkPlan with CastSupport {
+  extends GpuExec with ShimSparkPlan with LeafExecNode with CastSupport {
 
-  override def children: Seq[SparkPlan] = Seq[SparkPlan]() // No children for text file reader.
+//  override def children: Seq[SparkPlan] = Seq.empty
+  // Seq[SparkPlan]() // No children for text file reader.
 
   override def producedAttributes: AttributeSet = outputSet ++
     AttributeSet(partitionPruningPredicate.flatMap(_.references))
@@ -187,15 +189,16 @@ case class GpuHiveTableScanExec(requestedAttributes: Seq[Attribute],
   override protected def doExecute(): RDD[InternalRow] =
     throw new IllegalStateException(s"Row-based execution should not occur for $this")
 
-  override val additionalMetrics: Map[String, GpuMetric] = Map(
+  override lazy val additionalMetrics: Map[String, GpuMetric] = Map(
     "numFiles" -> createMetric(ESSENTIAL_LEVEL, "number of files read"),
     "metadataTime" -> createTimingMetric(ESSENTIAL_LEVEL, "metadata time"),
     "filesSize" -> createSizeMetric(ESSENTIAL_LEVEL, "size of files read"),
     GPU_DECODE_TIME -> createNanoTimingMetric(MODERATE_LEVEL, DESCRIPTION_GPU_DECODE_TIME),
     BUFFER_TIME -> createNanoTimingMetric(MODERATE_LEVEL, DESCRIPTION_BUFFER_TIME),
     FILTER_TIME -> createNanoTimingMetric(DEBUG_LEVEL, DESCRIPTION_FILTER_TIME),
-    PEAK_DEVICE_MEMORY -> createSizeMetric(MODERATE_LEVEL, DESCRIPTION_PEAK_DEVICE_MEMORY)
-  )
+    PEAK_DEVICE_MEMORY -> createSizeMetric(MODERATE_LEVEL, DESCRIPTION_PEAK_DEVICE_MEMORY),
+    "scanTime" -> createTimingMetric(ESSENTIAL_LEVEL, "scan time")
+  ) ++ semaphoreMetrics
 
   private def buildReader(sqlConf: SQLConf,
                           broadcastConf: Broadcast[SerializableConfiguration],
@@ -298,7 +301,6 @@ case class GpuHiveTableScanExec(requestedAttributes: Seq[Attribute],
   }
 
   override protected def doExecuteColumnar(): RDD[ColumnarBatch] = {
-  //    GpuColumnVector.from( returned_table_from_readCSV, read_schema)
     if (hiveTableRelation.isPartitioned) {
       throw new UnsupportedOperationException("Partitioned Hive text tables currently unsupported.")
     }
@@ -322,8 +324,6 @@ case class GpuHiveTableScanExec(requestedAttributes: Seq[Attribute],
         }
       }
     }
-
-    null
   }
 }
 
@@ -344,12 +344,17 @@ case class GpuHiveTextPartitionReaderFactory(
     throw new IllegalStateException("Row-based text parsing is not supported on GPU.")
   }
 
+  private val csvOptions = new CSVOptions(options,
+                                          sqlConf.csvColumnPruning,
+                                          sqlConf.sessionLocalTimeZone,
+                                          sqlConf.columnNameOfCorruptRecord)
+
   override def buildColumnarReader(partFile: PartitionedFile): PartitionReader[ColumnarBatch] = {
     val conf = broadcastConf.value.value
     val reader = new PartitionReaderWithBytesRead(
                    new GpuHiveDelimitedTextPartitionReader(
-                     conf, sqlConf, partFile, dataSchema,
-                     readSchema, options, maxReaderBatchSizeRows,
+                     conf, csvOptions, partFile, dataSchema,
+                     readSchema, maxReaderBatchSizeRows,
                      maxReaderBatchSizeBytes, metrics))
     ColumnarPartitionReaderWithPartitionValues.newReader(partFile, reader, partitionSchema)
   }
@@ -358,19 +363,24 @@ case class GpuHiveTextPartitionReaderFactory(
 // Reader that converts from chunked data buffers into cudf.Table.
 class GpuHiveDelimitedTextPartitionReader(
     conf: Configuration,
-    sqlConf: SQLConf,
+    csvOptions: CSVOptions,
+//    sqlConf: SQLConf,
     partFile: PartitionedFile,
     dataSchema: StructType,
     readDataSchema: StructType,
-    options: Map[String, String],
+//    options: Map[String, String],
     maxRowsPerChunk: Integer,
     maxBytesPerChunk: Long,
     execMetrics: Map[String, GpuMetric]) extends
   CSVPartitionReader(conf, partFile, dataSchema, readDataSchema,
+                     /*
                      new CSVOptions(options,
-                                    sqlConf.csvColumnPruning,
-                                    sqlConf.sessionLocalTimeZone,
-                                    sqlConf.columnNameOfCorruptRecord),
+                                    true, // sqlConf.csvColumnPruning,
+                                    "UTC",// sqlConf.sessionLocalTimeZone,
+                                    "_corrupt_record__"),// sqlConf.columnNameOfCorruptRecord),
+
+                      */
+                     csvOptions,
                      maxRowsPerChunk, maxBytesPerChunk, execMetrics) {
 
   override def buildCsvOptions(parsedOptions: CSVOptions,
@@ -378,5 +388,16 @@ class GpuHiveDelimitedTextPartitionReader(
                                hasHeader: Boolean): ai.rapids.cudf.CSVOptions.Builder = {
     super.buildCsvOptions(parsedOptions, schema, hasHeader)
       .withDelim('\u0001')
+  }
+
+  override def readToTable(
+      dataBuffer: HostMemoryBuffer,
+      dataSize: Long,
+      cudfSchema: Schema,
+      readDataSchema: StructType,
+      isFirstChunk: Boolean): Table = {
+    val table = super.readToTable(dataBuffer, dataSize, cudfSchema, readDataSchema, isFirstChunk)
+    GpuColumnVector.debug("Output table: ", table)
+    table
   }
 }
