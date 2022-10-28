@@ -17,15 +17,15 @@
 package org.apache.spark.sql.hive.rapids
 
 import ai.rapids.cudf.{HostMemoryBuffer, Schema, Table}
-import com.nvidia.spark.rapids.GpuMetric.{BUFFER_TIME, DEBUG_LEVEL, DESCRIPTION_BUFFER_TIME, DESCRIPTION_FILTER_TIME, DESCRIPTION_GPU_DECODE_TIME, DESCRIPTION_PEAK_DEVICE_MEMORY, ESSENTIAL_LEVEL, FILTER_TIME, GPU_DECODE_TIME, MODERATE_LEVEL, NUM_OUTPUT_ROWS, PEAK_DEVICE_MEMORY}
 
-import scala.collection.JavaConverters._
+import com.nvidia.spark.rapids.GpuMetric.{BUFFER_TIME, DEBUG_LEVEL, DESCRIPTION_BUFFER_TIME, DESCRIPTION_FILTER_TIME, DESCRIPTION_GPU_DECODE_TIME, DESCRIPTION_PEAK_DEVICE_MEMORY, ESSENTIAL_LEVEL, FILTER_TIME, GPU_DECODE_TIME, MODERATE_LEVEL, NUM_OUTPUT_ROWS, PEAK_DEVICE_MEMORY}
 import com.nvidia.spark.rapids.{CSVPartitionReader, ColumnarPartitionReaderWithPartitionValues, GpuColumnVector, GpuExec, GpuMetric, PartitionReaderIterator, PartitionReaderWithBytesRead, RapidsConf}
 import com.nvidia.spark.rapids.shims.{ShimFilePartitionReaderFactory, ShimSparkPlan, SparkShimImpl}
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileStatus, Path}
 import org.apache.hadoop.hive.ql.metadata.{Partition => HivePartition}
 import org.apache.hadoop.hive.ql.plan.TableDesc
+
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SparkSession
@@ -35,8 +35,8 @@ import org.apache.spark.sql.catalyst.catalog.HiveTableRelation
 import org.apache.spark.sql.catalyst.csv.CSVOptions
 import org.apache.spark.sql.catalyst.expressions.{And, Attribute, AttributeMap, AttributeReference, AttributeSet, BindReferences, Expression, Literal}
 import org.apache.spark.sql.connector.read.PartitionReader
-import org.apache.spark.sql.execution.datasources.{FilePartition, PartitionDirectory, PartitionedFile}
 import org.apache.spark.sql.execution.{ExecSubqueryExpression, LeafExecNode, PartitionedFileUtil}
+import org.apache.spark.sql.execution.datasources.{FilePartition, PartitionDirectory, PartitionedFile}
 import org.apache.spark.sql.hive.client.HiveClientImpl
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{BooleanType, DataType, StructType}
@@ -45,15 +45,14 @@ import org.apache.spark.util.SerializableConfiguration
 
 import java.net.URI
 import java.util.concurrent.TimeUnit.NANOSECONDS
+
+import scala.collection.JavaConverters._
 import scala.collection.immutable.HashSet
 
 case class GpuHiveTableScanExec(requestedAttributes: Seq[Attribute],
                                 hiveTableRelation: HiveTableRelation,
                                 partitionPruningPredicate: Seq[Expression])
   extends GpuExec with ShimSparkPlan with LeafExecNode with CastSupport {
-
-//  override def children: Seq[SparkPlan] = Seq.empty
-  // Seq[SparkPlan]() // No children for text file reader.
 
   override def producedAttributes: AttributeSet = outputSet ++
     AttributeSet(partitionPruningPredicate.flatMap(_.references))
@@ -80,49 +79,6 @@ case class GpuHiveTableScanExec(requestedAttributes: Seq[Attribute],
     hiveQlTable.getInputFormatClass,
     hiveQlTable.getOutputFormatClass,
     hiveQlTable.getMetadata)
-
-  // Create a local copy of hadoopConf,so that scan specific modifications should not impact
-  // other queries
-//      Note: hadoopConf is required to construct `hadoopReader`.
-//            Might not be required for spark-rapids.
-//  @transient private lazy val hadoopConf = {
-//    val c = sparkSession.sessionState.newHadoopConf()
-//     append columns ids and names before broadcast
-//    addColumnMetadataToConf(c)
-//    c
-//  }
-
-  /*
-  Note: Required to construct hadoopConf, to construct hadoopReader.
-        This might not be required for spark-rapids based reads.
-  private def addColumnMetadataToConf(hiveConf: Configuration): Unit = {
-    // Specifies needed column IDs for those non-partitioning columns.
-    val columnOrdinals = AttributeMap(hiveTableRelation.dataCols.zipWithIndex)
-    val neededColumnIDs = output.flatMap(columnOrdinals.get).map(o => o: Integer)
-    val neededColumnNames = output.filter(columnOrdinals.contains).map(_.name)
-
-    HiveShim.appendReadColumns(hiveConf, neededColumnIDs, neededColumnNames)
-
-    val deserializer = tableDesc.getDeserializerClass.getConstructor().newInstance()
-    deserializer.initialize(hiveConf, tableDesc.getProperties)
-
-    // Specifies types and object inspectors of columns to be scanned.
-    val structOI = ObjectInspectorUtils
-      .getStandardObjectInspector(
-        deserializer.getObjectInspector,
-        ObjectInspectorCopyOption.JAVA)
-      .asInstanceOf[StructObjectInspector]
-
-    val columnTypeNames = structOI
-      .getAllStructFieldRefs.asScala
-      .map(_.getFieldObjectInspector)
-      .map(TypeInfoUtils.getTypeInfoFromObjectInspector(_).getTypeName)
-      .mkString(",")
-
-    hiveConf.set(serdeConstants.LIST_COLUMN_TYPES, columnTypeNames)
-    hiveConf.set(serdeConstants.LIST_COLUMNS, hiveTableRelation.dataCols.map(_.name).mkString(","))
-  }
-  */
 
   private def castFromString(value: String, dataType: DataType) = {
     cast(Literal(value), dataType).eval(null)
@@ -231,6 +187,51 @@ case class GpuHiveTableScanExec(requestedAttributes: Seq[Attribute],
     StructType(filteredFields)
   }
 
+  private def createReadRDDForDirectories(
+                readFile: PartitionedFile => Iterator[InternalRow],
+                directories: Array[URI],
+                readSchema: StructType,
+                sparkSession: SparkSession,
+                hadoopConf: Configuration): RDD[InternalRow] = {
+
+    def isNonEmptyDataFile(f: FileStatus): Boolean = {
+      if (!f.isFile || f.getLen == 0) {
+        false
+      }
+      else {
+        val name = f.getPath.getName
+        !((name.startsWith("_") && !name.contains("=")) || name.startsWith("."))
+      }
+    }
+
+    def partitionValuesAsRow: InternalRow = {
+      InternalRow.empty
+    }
+
+    val filePartitions: Seq[FilePartition] = directories.flatMap { directory =>
+      val path               = new Path(directory)
+      val fs                 = path.getFileSystem(hadoopConf)
+      val dirContents        = fs.listStatus(path).filter(isNonEmptyDataFile)
+      val partitionDirectory = PartitionDirectory(partitionValuesAsRow, dirContents)
+      val maxSplitBytes      = FilePartition.maxSplitBytes(sparkSession, Array(partitionDirectory))
+
+      val splitFiles: Seq[PartitionedFile] = dirContents.flatMap { f =>
+        PartitionedFileUtil.splitFiles(
+          sparkSession,
+          f,
+          f.getPath,
+          isSplitable = true,
+          maxSplitBytes,
+          partitionDirectory.values
+        )
+      }.sortBy(_.length)(implicitly[Ordering[Long]].reverse)
+      FilePartition.getFilePartitions(sparkSession, splitFiles, maxSplitBytes)
+    }
+
+    // TODO: Handle small-file optimization. Currently assuming per-file reading.
+    SparkShimImpl.getFileScanRDD(sparkSession, readFile, filePartitions, readSchema)
+  }
+
   private def createReadRDDForTable(
                 readFile: PartitionedFile => Iterator[InternalRow],
                 hiveTableRelation: HiveTableRelation,
@@ -242,43 +243,16 @@ case class GpuHiveTableScanExec(requestedAttributes: Seq[Attribute],
       throw new UnsupportedOperationException("Table path not found")
     }
 
-    val tablePath = new Path(tableLocation)
-    val fs        = tablePath.getFileSystem(hadoopConf)
-
-    def isNonEmptyDataFile(f: FileStatus) = {
-      if (!f.isFile || f.getLen == 0) {
-        false
-      }
-      else {
-        val name = f.getPath.getName
-        !((name.startsWith("_") && !name.contains("=")) || name.startsWith("."))
-      }
-    }
-
-    val dirContents = fs.listStatus(tablePath).filter(isNonEmptyDataFile)
-    val partitionDirectory = PartitionDirectory(InternalRow.empty, dirContents)
-    val maxSplitBytes = FilePartition.maxSplitBytes(sparkSession, Array(partitionDirectory))
-
-    val splitFiles = dirContents.flatMap { f =>
-      PartitionedFileUtil.splitFiles(
-        sparkSession,
-        f,
-        f.getPath,
-        isSplitable = true,
-        maxSplitBytes,
-        partitionDirectory.values
-      )
-    }.sortBy(_.length)(implicitly[Ordering[Long]].reverse)
-
-    val filePartitions = FilePartition.getFilePartitions(sparkSession, splitFiles, maxSplitBytes)
-
-    // TODO: Assuming per-file reading.
-    SparkShimImpl.getFileScanRDD(sparkSession, readFile, filePartitions, readSchema)
+    createReadRDDForDirectories(readFile,
+                                Array(tableLocation),
+                                readSchema,
+                                sparkSession,
+                                hadoopConf)
   }
 
   lazy val inputRDD: RDD[InternalRow] = {
     // Assume Delimited text.
-    // TODO: Check if `options` is required.
+    // Note: The populated `options` aren't strictly required for text, currently.
     val options             = hiveTableRelation.tableMeta.properties ++
                               hiveTableRelation.tableMeta.storage.properties
     val hadoopConf          = sparkSession.sessionState.newHadoopConfWithOptions(options)
@@ -364,22 +338,13 @@ case class GpuHiveTextPartitionReaderFactory(
 class GpuHiveDelimitedTextPartitionReader(
     conf: Configuration,
     csvOptions: CSVOptions,
-//    sqlConf: SQLConf,
     partFile: PartitionedFile,
     dataSchema: StructType,
     readDataSchema: StructType,
-//    options: Map[String, String],
     maxRowsPerChunk: Integer,
     maxBytesPerChunk: Long,
     execMetrics: Map[String, GpuMetric]) extends
   CSVPartitionReader(conf, partFile, dataSchema, readDataSchema,
-                     /*
-                     new CSVOptions(options,
-                                    true, // sqlConf.csvColumnPruning,
-                                    "UTC",// sqlConf.sessionLocalTimeZone,
-                                    "_corrupt_record__"),// sqlConf.columnNameOfCorruptRecord),
-
-                      */
                      csvOptions,
                      maxRowsPerChunk, maxBytesPerChunk, execMetrics) {
 
@@ -390,6 +355,7 @@ class GpuHiveDelimitedTextPartitionReader(
       .withDelim('\u0001')
   }
 
+  // TODO: Remove this. Only for debugging.
   override def readToTable(
       dataBuffer: HostMemoryBuffer,
       dataSize: Long,
@@ -397,7 +363,7 @@ class GpuHiveDelimitedTextPartitionReader(
       readDataSchema: StructType,
       isFirstChunk: Boolean): Table = {
     val table = super.readToTable(dataBuffer, dataSize, cudfSchema, readDataSchema, isFirstChunk)
-    GpuColumnVector.debug("Output table: ", table)
+    GpuColumnVector.debug("Output table 2: ", table)
     table
   }
 }
