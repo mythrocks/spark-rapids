@@ -64,6 +64,8 @@ case class GpuHiveTableScanExec(requestedAttributes: Seq[Attribute],
     requestedAttributes.map(originalAttributes)
   }
 
+  val partitionAttributes: Seq[AttributeReference] = hiveTableRelation.partitionCols
+
   // Bind all partition key attribute references in the partition pruning predicate for later
   // evaluation.
   private lazy val boundPruningPred = partitionPruningPredicate.reduceLeftOption(And).map { pred =>
@@ -180,16 +182,21 @@ case class GpuHiveTableScanExec(requestedAttributes: Seq[Attribute],
   }
 
   private def getReadSchema(tableSchema: StructType,
+                            partitionAttributes: Seq[Attribute],
                             requestedAttributes: Seq[Attribute]): StructType = {
     // TODO: Should this filter out partition fields? Handle later?
     val requestedSet: HashSet[String] = HashSet() ++ requestedAttributes.map(_.name)
-    val filteredFields = tableSchema.filter(f => requestedSet.contains(f.name))
-    StructType(filteredFields)
+    val partitionKeys: HashSet[String] = HashSet() ++ partitionAttributes.map(_.name)
+    val prunedFields = tableSchema.filter {
+      f => requestedSet.contains(f.name) && !partitionKeys.contains(f.name)
+    }
+    StructType(prunedFields)
   }
 
   private def createReadRDDForDirectories(
                 readFile: PartitionedFile => Iterator[InternalRow],
-                directories: Array[URI],
+                directories: Seq[(URI, InternalRow)], // TODO: Array[(URI, Seq[Any])],
+                                                      // i.e. (path, partition_values).
                 readSchema: StructType,
                 sparkSession: SparkSession,
                 hadoopConf: Configuration): RDD[InternalRow] = {
@@ -204,15 +211,11 @@ case class GpuHiveTableScanExec(requestedAttributes: Seq[Attribute],
       }
     }
 
-    def partitionValuesAsRow: InternalRow = {
-      InternalRow.empty
-    }
-
-    val filePartitions: Seq[FilePartition] = directories.flatMap { directory =>
+    val filePartitions: Seq[FilePartition] = directories.flatMap { case (directory, partValues) =>
       val path               = new Path(directory)
       val fs                 = path.getFileSystem(hadoopConf)
       val dirContents        = fs.listStatus(path).filter(isNonEmptyDataFile)
-      val partitionDirectory = PartitionDirectory(partitionValuesAsRow, dirContents)
+      val partitionDirectory = PartitionDirectory(partValues, dirContents)
       val maxSplitBytes      = FilePartition.maxSplitBytes(sparkSession, Array(partitionDirectory))
 
       val splitFiles: Seq[PartitionedFile] = dirContents.flatMap { f =>
@@ -244,10 +247,36 @@ case class GpuHiveTableScanExec(requestedAttributes: Seq[Attribute],
     }
 
     createReadRDDForDirectories(readFile,
-                                Array(tableLocation),
+                                Array((tableLocation, InternalRow.empty)),
                                 readSchema,
                                 sparkSession,
                                 hadoopConf)
+  }
+
+  private def createReadRDDForPartitions(
+                readFile: PartitionedFile => Iterator[InternalRow],
+                hiveTableRelation: HiveTableRelation,
+                readSchema: StructType,
+                sparkSession: SparkSession,
+                hadoopConf: Configuration
+              ): RDD[InternalRow] = {
+    val partitionColTypes = hiveTableRelation.partitionCols.map(_.dataType)
+    val dirsWithPartValues = prunedPartitions.map { p =>
+      // TODO: Check for non-existence.
+      val uri = p.getDataLocation.toUri
+      val partValues: Seq[Any] = {
+        p.getValues.asScala.zip(partitionColTypes).map {
+          case (value, dataType) => castFromString(value, dataType)
+        }
+      }
+      val partValuesAsInternalRow = InternalRow.fromSeq(partValues)
+
+      (uri, partValuesAsInternalRow)
+    }
+
+    createReadRDDForDirectories(readFile,
+      dirsWithPartValues, readSchema, sparkSession, hadoopConf)
+//    throw new UnsupportedOperationException("Partitioned Hive text tables currently unsupported.")
   }
 
   lazy val inputRDD: RDD[InternalRow] = {
@@ -261,6 +290,7 @@ case class GpuHiveTableScanExec(requestedAttributes: Seq[Attribute],
     val sqlConf             = sparkSession.sessionState.conf
     val rapidsConf          = new RapidsConf(sqlConf)
     val readSchema          = getReadSchema(hiveTableRelation.tableMeta.schema,
+                                            partitionAttributes,
                                             requestedAttributes)
 
     val reader = buildReader(sqlConf,
@@ -271,13 +301,37 @@ case class GpuHiveTableScanExec(requestedAttributes: Seq[Attribute],
                              readSchema,
                              options)
     // TODO: sendDriverMetrics()
-    createReadRDDForTable(reader, hiveTableRelation, readSchema, sparkSession, hadoopConf)
+    if (hiveTableRelation.isPartitioned) {
+      /*
+      val partitionColTypes = hiveTableRelation.partitionCols.map(_.dataType)
+      val dirsWithPartValues = prunedPartitions.map { p =>
+        // TODO: Check for non-existence.
+        val uri = p.getDataLocation.toUri
+        val partValues: Seq[Any] = {
+          p.getValues.asScala.zip(partitionColTypes).map {
+            case(value, dataType) => castFromString(value, dataType)
+          }
+        }
+        val partValuesAsInternalRow = InternalRow.fromSeq(partValues)
+
+        (uri, partValuesAsInternalRow)
+      }
+
+      throw new UnsupportedOperationException("Partitioned Hive text tables currently unsupported.")
+
+       */
+      createReadRDDForPartitions(reader, hiveTableRelation, readSchema, sparkSession, hadoopConf)
+    }
+    else {
+      createReadRDDForTable(reader, hiveTableRelation, readSchema, sparkSession, hadoopConf)
+    }
   }
 
   override protected def doExecuteColumnar(): RDD[ColumnarBatch] = {
-    if (hiveTableRelation.isPartitioned) {
-      throw new UnsupportedOperationException("Partitioned Hive text tables currently unsupported.")
-    }
+//    if (hiveTableRelation.isPartitioned) {
+//      throw new UnsupportedOperationException(
+//        "Partitioned Hive text tables currently unsupported.")
+//    }
     val numOutputRows = gpuLongMetric(NUM_OUTPUT_ROWS)
     val scanTime = gpuLongMetric("scanTime")
     inputRDD.asInstanceOf[RDD[ColumnarBatch]].mapPartitionsInternal { batches =>
