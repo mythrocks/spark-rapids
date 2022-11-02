@@ -334,7 +334,7 @@ case class GpuHiveTableScanExec(requestedAttributes: Seq[Attribute],
 //    }
     val numOutputRows = gpuLongMetric(NUM_OUTPUT_ROWS)
     val scanTime = gpuLongMetric("scanTime")
-    inputRDD.asInstanceOf[RDD[ColumnarBatch]].mapPartitionsInternal { batches =>
+    val ret = inputRDD.asInstanceOf[RDD[ColumnarBatch]].mapPartitionsInternal { batches =>
       new Iterator[ColumnarBatch] {
 
         override def hasNext: Boolean = {
@@ -352,6 +352,13 @@ case class GpuHiveTableScanExec(requestedAttributes: Seq[Attribute],
         }
       }
     }
+    // TODO: CALEB: Remove Debugging.
+    ret.foreach { cb =>
+      withResource(cb) { cb =>
+        GpuColumnVector.debug(" Checking RDD contents: ", cb)
+      }
+    }
+    ret
   }
 }
 
@@ -417,7 +424,7 @@ class GpuHiveDelimitedTextPartitionReader(
       readDataSchema: StructType,
       isFirstChunk: Boolean): Table = {
     val table = super.readToTable(dataBuffer, dataSize, cudfSchema, readDataSchema, isFirstChunk)
-    GpuColumnVector.debug("Output table 2: ", table)
+    GpuColumnVector.debug("GpuHiveDelimTextPartReader::readToTable(): ", table)
     table
   }
 }

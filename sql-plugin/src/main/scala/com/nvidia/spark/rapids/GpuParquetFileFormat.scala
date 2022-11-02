@@ -376,6 +376,7 @@ class GpuParquetWriter(
   override def write(batch: ColumnarBatch,
                      statsTrackers: Seq[ColumnarWriteTaskStatsTracker]): Unit = {
     val newBatch = withResource(batch) { batch =>
+      GpuColumnVector.debug("CALEB: GpuParquetFileFormat::write(): Writing: ", batch)
       val transformedCols = GpuColumnVector.extractColumns(batch).safeMap { cv =>
         new GpuColumnVector(cv.dataType, deepTransformColumn(cv.getBase, cv.dataType))
           .asInstanceOf[org.apache.spark.sql.vectorized.ColumnVector]

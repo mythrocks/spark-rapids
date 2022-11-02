@@ -180,6 +180,7 @@ public class RapidsHostColumnVectorCore extends ColumnVector {
 
   @Override
   public final UTF8String getUTF8String(int rowId) {
+    GpuColumnVector.debug("Debugging String conversion: ", cudfCv);
     return UTF8String.fromBytes(cudfCv.getUTF8(rowId));
   }
 

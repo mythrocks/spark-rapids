@@ -241,6 +241,7 @@ abstract class GpuTextBasedPartitionReader(
           }
         }
 
+        GpuColumnVector.debug("CALEB: GpuTextBasedPartReader::readToTable():", castTable)
         handleResult(newReadDataSchema, castTable)
       }
     } finally {
