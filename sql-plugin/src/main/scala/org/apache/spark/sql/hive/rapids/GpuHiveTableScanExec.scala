@@ -17,7 +17,6 @@
 package org.apache.spark.sql.hive.rapids
 
 import ai.rapids.cudf.{HostMemoryBuffer, Schema, Table}
-
 import com.nvidia.spark.rapids.GpuMetric.{BUFFER_TIME, DEBUG_LEVEL, DESCRIPTION_BUFFER_TIME, DESCRIPTION_FILTER_TIME, DESCRIPTION_GPU_DECODE_TIME, DESCRIPTION_PEAK_DEVICE_MEMORY, ESSENTIAL_LEVEL, FILTER_TIME, GPU_DECODE_TIME, MODERATE_LEVEL, NUM_OUTPUT_ROWS, PEAK_DEVICE_MEMORY}
 import com.nvidia.spark.rapids.{CSVPartitionReader, ColumnarPartitionReaderWithPartitionValues, GpuColumnVector, GpuExec, GpuMetric, PartitionReaderIterator, PartitionReaderWithBytesRead, RapidsConf}
 import com.nvidia.spark.rapids.shims.{ShimFilePartitionReaderFactory, ShimSparkPlan, SparkShimImpl}
@@ -25,10 +24,9 @@ import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileStatus, Path}
 import org.apache.hadoop.hive.ql.metadata.{Partition => HivePartition}
 import org.apache.hadoop.hive.ql.plan.TableDesc
-
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.{SparkSession, types}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.CastSupport
 import org.apache.spark.sql.catalyst.catalog.HiveTableRelation
@@ -45,7 +43,6 @@ import org.apache.spark.util.SerializableConfiguration
 
 import java.net.URI
 import java.util.concurrent.TimeUnit.NANOSECONDS
-
 import scala.collection.JavaConverters._
 import scala.collection.immutable.HashSet
 
@@ -181,16 +178,22 @@ case class GpuHiveTableScanExec(requestedAttributes: Seq[Attribute],
     PartitionReaderIterator.buildReader(readerFactory)
   }
 
+  /**
+   * Prune output projection to those columns that are to be read from
+   * the input file/buffer.
+   * Removes partition columns, and returns the resultant schema
+   * as a [[StructType]].
+   */
   private def getReadSchema(tableSchema: StructType,
                             partitionAttributes: Seq[Attribute],
                             requestedAttributes: Seq[Attribute]): StructType = {
-    // TODO: Should this filter out partition fields? Handle later?
-    val requestedSet: HashSet[String] = HashSet() ++ requestedAttributes.map(_.name)
     val partitionKeys: HashSet[String] = HashSet() ++ partitionAttributes.map(_.name)
-    val prunedFields = tableSchema.filter {
-      f => requestedSet.contains(f.name) && !partitionKeys.contains(f.name)
-    }
-    StructType(prunedFields)
+    val requestedCols = requestedAttributes.filter(a => !partitionKeys.contains(a.name))
+                                           .toList
+
+    val distinctColumns = requestedCols.distinct
+    val distinctFields  = distinctColumns.map(a => tableSchema.apply(a.name))
+    StructType(distinctFields)
   }
 
   private def createReadRDDForDirectories(
@@ -423,6 +426,16 @@ class GpuHiveDelimitedTextPartitionReader(
       cudfSchema: Schema,
       readDataSchema: StructType,
       isFirstChunk: Boolean): Table = {
+    // cudfSchema == Schema of the input file/buffer.
+    //               Presented in the order of input columns in the file.
+    // readSchema == Spark output schema. This is inexplicably sorted alphabetically
+    //               in HiveTSExec, unlike FileSourceScanExec (which has file-input
+    //               ordering).
+    //               This trips up the downstream string->numeric casts in
+    //               GpuTextBasedPartitionReader.readToTable().
+    // But given that Table.readCsv presents the output columns in the order
+    // of the input file, one option is to rearrange the readDataSchema from
+    // alphabetical to that in cudfSchema/tableSchema.
     val table = super.readToTable(dataBuffer, dataSize, cudfSchema, readDataSchema, isFirstChunk)
     GpuColumnVector.debug("GpuHiveDelimTextPartReader::readToTable(): ", table)
     table
