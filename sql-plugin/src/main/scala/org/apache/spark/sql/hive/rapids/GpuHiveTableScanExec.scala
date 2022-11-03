@@ -26,7 +26,7 @@ import org.apache.hadoop.hive.ql.metadata.{Partition => HivePartition}
 import org.apache.hadoop.hive.ql.plan.TableDesc
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.{SparkSession, types}
+import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.CastSupport
 import org.apache.spark.sql.catalyst.catalog.HiveTableRelation
@@ -180,13 +180,16 @@ case class GpuHiveTableScanExec(requestedAttributes: Seq[Attribute],
 
   /**
    * Prune output projection to those columns that are to be read from
-   * the input file/buffer.
+   * the input file/buffer, in the same order as [[requestedAttributes]]
    * Removes partition columns, and returns the resultant schema
    * as a [[StructType]].
    */
   private def getReadSchema(tableSchema: StructType,
                             partitionAttributes: Seq[Attribute],
                             requestedAttributes: Seq[Attribute]): StructType = {
+    // Read schema in the same order as requestedAttributes.
+    // Note: This might differ from the column order in `tableSchema`.
+    //       In fact, HiveTableScanExec specifies `requestedAttributes` alphabetically.
     val partitionKeys: HashSet[String] = HashSet() ++ partitionAttributes.map(_.name)
     val requestedCols = requestedAttributes.filter(a => !partitionKeys.contains(a.name))
                                            .toList
@@ -194,6 +197,15 @@ case class GpuHiveTableScanExec(requestedAttributes: Seq[Attribute],
     val distinctColumns = requestedCols.distinct
     val distinctFields  = distinctColumns.map(a => tableSchema.apply(a.name))
     StructType(distinctFields)
+    /*
+    // Read schema in the same order as tableSchema.
+    val requestedSet: HashSet[String] = HashSet() ++ requestedAttributes.map(_.name)
+    val partitionKeys: HashSet[String] = HashSet() ++ partitionAttributes.map(_.name)
+    val prunedFields = tableSchema.filter {
+      f => requestedSet.contains(f.name) && !partitionKeys.contains(f.name)
+    }
+    StructType(prunedFields)
+     */
   }
 
   private def createReadRDDForDirectories(
@@ -434,10 +446,21 @@ class GpuHiveDelimitedTextPartitionReader(
     //               This trips up the downstream string->numeric casts in
     //               GpuTextBasedPartitionReader.readToTable().
     // But given that Table.readCsv presents the output columns in the order
-    // of the input file, one option is to rearrange the readDataSchema from
-    // alphabetical to that in cudfSchema/tableSchema.
+    // of the input file, one option is to the reorder the table read from the input file
+    // in the order specified in readDataSchema (i.e. requiredAttributes).
     val table = super.readToTable(dataBuffer, dataSize, cudfSchema, readDataSchema, isFirstChunk)
     GpuColumnVector.debug("GpuHiveDelimTextPartReader::readToTable(): ", table)
-    table
+    // TODO: Rearrange here.
+    withResource(table) { table =>
+      val requiredColumnSequence = readDataSchema.map(_.name).toList
+      val requiredColumnSet      = requiredColumnSequence.toSet
+      val outputColumnNames      = cudfSchema.getColumnNames
+                                             .filter(c => requiredColumnSet.contains(c))
+      val reorderedColumns       = requiredColumnSequence.map(
+        colName => table.getColumn(outputColumnNames.indexOf(colName)))
+      val reorderedTable         = new Table(reorderedColumns: _*)
+      GpuColumnVector.debug("Reordered table: ", reorderedTable)
+      reorderedTable
+    }
   }
 }
