@@ -16,7 +16,8 @@
 
 package org.apache.spark.sql.hive.rapids
 
-import ai.rapids.cudf.{HostMemoryBuffer, Schema, Table}
+import ai.rapids.cudf.{HostMemoryBuffer, Scalar, Schema, Table}
+import com.nvidia.spark.RebaseHelper.withResource
 import com.nvidia.spark.rapids.GpuMetric.{BUFFER_TIME, DEBUG_LEVEL, DESCRIPTION_BUFFER_TIME, DESCRIPTION_FILTER_TIME, DESCRIPTION_GPU_DECODE_TIME, DESCRIPTION_PEAK_DEVICE_MEMORY, ESSENTIAL_LEVEL, FILTER_TIME, GPU_DECODE_TIME, MODERATE_LEVEL, NUM_OUTPUT_ROWS, PEAK_DEVICE_MEMORY}
 import com.nvidia.spark.rapids.{CSVPartitionReader, ColumnarPartitionReaderWithPartitionValues, GpuColumnVector, GpuExec, GpuMetric, PartitionReaderIterator, PartitionReaderWithBytesRead, RapidsConf}
 import com.nvidia.spark.rapids.shims.{ShimFilePartitionReaderFactory, ShimSparkPlan, SparkShimImpl}
@@ -166,9 +167,10 @@ case class GpuHiveTableScanExec(requestedAttributes: Seq[Attribute],
     val readerFactory = GpuHiveTextPartitionReaderFactory(
       sqlConf = sqlConf,
       broadcastConf = broadcastConf,
-      dataSchema = dataSchema,
+      inputFileSchema = dataSchema,
       partitionSchema = partitionSchema,
-      readSchema = readSchema,
+      requestedOutputDataSchema = readSchema,
+      requestedAttributes = requestedAttributes,
       maxReaderBatchSizeRows = rapidsConf.maxReadBatchSizeRows,
       maxReaderBatchSizeBytes = rapidsConf.maxReadBatchSizeBytes,
       metrics = allMetrics,
@@ -184,38 +186,25 @@ case class GpuHiveTableScanExec(requestedAttributes: Seq[Attribute],
    * Removes partition columns, and returns the resultant schema
    * as a [[StructType]].
    */
-  private def getReadSchema(tableSchema: StructType,
-                            partitionAttributes: Seq[Attribute],
-                            requestedAttributes: Seq[Attribute]): StructType = {
+  private def getRequestedOutputDataSchema(tableSchema: StructType,
+                                           partitionAttributes: Seq[Attribute],
+                                           requestedAttributes: Seq[Attribute]): StructType = {
     // Read schema in the same order as requestedAttributes.
     // Note: This might differ from the column order in `tableSchema`.
     //       In fact, HiveTableScanExec specifies `requestedAttributes` alphabetically.
     val partitionKeys: HashSet[String] = HashSet() ++ partitionAttributes.map(_.name)
     val requestedCols = requestedAttributes.filter(a => !partitionKeys.contains(a.name))
                                            .toList
-
     val distinctColumns = requestedCols.distinct
     val distinctFields  = distinctColumns.map(a => tableSchema.apply(a.name))
     StructType(distinctFields)
-    /*
-    // Read schema in the same order as tableSchema.
-    val requestedSet: HashSet[String] = HashSet() ++ requestedAttributes.map(_.name)
-    val partitionKeys: HashSet[String] = HashSet() ++ partitionAttributes.map(_.name)
-    val prunedFields = tableSchema.filter {
-      f => requestedSet.contains(f.name) && !partitionKeys.contains(f.name)
-    }
-    StructType(prunedFields)
-     */
   }
 
-  private def createReadRDDForDirectories(
-                readFile: PartitionedFile => Iterator[InternalRow],
-                directories: Seq[(URI, InternalRow)], // TODO: Array[(URI, Seq[Any])],
-                                                      // i.e. (path, partition_values).
-                readSchema: StructType,
-                sparkSession: SparkSession,
-                hadoopConf: Configuration): RDD[InternalRow] = {
-
+  private def createReadRDDForDirectories(readFile: PartitionedFile => Iterator[InternalRow],
+                                          directories: Seq[(URI, InternalRow)],
+                                          readSchema: StructType,
+                                          sparkSession: SparkSession,
+                                          hadoopConf: Configuration): RDD[InternalRow] = {
     def isNonEmptyDataFile(f: FileStatus): Boolean = {
       if (!f.isFile || f.getLen == 0) {
         false
@@ -297,56 +286,36 @@ case class GpuHiveTableScanExec(requestedAttributes: Seq[Attribute],
   lazy val inputRDD: RDD[InternalRow] = {
     // Assume Delimited text.
     // Note: The populated `options` aren't strictly required for text, currently.
-    val options             = hiveTableRelation.tableMeta.properties ++
-                              hiveTableRelation.tableMeta.storage.properties
-    val hadoopConf          = sparkSession.sessionState.newHadoopConfWithOptions(options)
-    val broadcastHadoopConf = sparkSession.sparkContext.broadcast(
-                                new SerializableConfiguration(hadoopConf))
-    val sqlConf             = sparkSession.sessionState.conf
-    val rapidsConf          = new RapidsConf(sqlConf)
-    val readSchema          = getReadSchema(hiveTableRelation.tableMeta.schema,
-                                            partitionAttributes,
-                                            requestedAttributes)
+    val options                   = hiveTableRelation.tableMeta.properties ++
+                                    hiveTableRelation.tableMeta.storage.properties
+    val hadoopConf                = sparkSession.sessionState.newHadoopConfWithOptions(options)
+    val broadcastHadoopConf       = sparkSession.sparkContext.broadcast(
+                                      new SerializableConfiguration(hadoopConf))
+    val sqlConf                   = sparkSession.sessionState.conf
+    val rapidsConf                = new RapidsConf(sqlConf)
+    val requestedOutputDataSchema = getRequestedOutputDataSchema(hiveTableRelation.tableMeta.schema,
+                                                  partitionAttributes,
+                                                  requestedAttributes)
 
     val reader = buildReader(sqlConf,
                              broadcastHadoopConf,
                              rapidsConf,
                              hiveTableRelation.tableMeta.dataSchema,
                              hiveTableRelation.tableMeta.partitionSchema,
-                             readSchema,
+                             requestedOutputDataSchema,
                              options)
     // TODO: sendDriverMetrics()
     if (hiveTableRelation.isPartitioned) {
-      /*
-      val partitionColTypes = hiveTableRelation.partitionCols.map(_.dataType)
-      val dirsWithPartValues = prunedPartitions.map { p =>
-        // TODO: Check for non-existence.
-        val uri = p.getDataLocation.toUri
-        val partValues: Seq[Any] = {
-          p.getValues.asScala.zip(partitionColTypes).map {
-            case(value, dataType) => castFromString(value, dataType)
-          }
-        }
-        val partValuesAsInternalRow = InternalRow.fromSeq(partValues)
-
-        (uri, partValuesAsInternalRow)
-      }
-
-      throw new UnsupportedOperationException("Partitioned Hive text tables currently unsupported.")
-
-       */
-      createReadRDDForPartitions(reader, hiveTableRelation, readSchema, sparkSession, hadoopConf)
+      createReadRDDForPartitions(reader, hiveTableRelation, requestedOutputDataSchema,
+                                 sparkSession, hadoopConf)
     }
     else {
-      createReadRDDForTable(reader, hiveTableRelation, readSchema, sparkSession, hadoopConf)
+      createReadRDDForTable(reader, hiveTableRelation, requestedOutputDataSchema,
+                            sparkSession, hadoopConf)
     }
   }
 
   override protected def doExecuteColumnar(): RDD[ColumnarBatch] = {
-//    if (hiveTableRelation.isPartitioned) {
-//      throw new UnsupportedOperationException(
-//        "Partitioned Hive text tables currently unsupported.")
-//    }
     val numOutputRows = gpuLongMetric(NUM_OUTPUT_ROWS)
     val scanTime = gpuLongMetric("scanTime")
     val ret = inputRDD.asInstanceOf[RDD[ColumnarBatch]].mapPartitionsInternal { batches =>
@@ -377,17 +346,64 @@ case class GpuHiveTableScanExec(requestedAttributes: Seq[Attribute],
   }
 }
 
+/**
+ * Partition-reader styled similarly to [[ColumnarPartitionReaderWithPartitionValues]],
+ * but orders the output columns alphabetically.
+ * This is required since the [[GpuHiveTableScanExec.requestedAttributes]] have the columns
+ * ordered alphabetically by name, even though the table schema (and hence, the file-schema)
+ * need not.
+ */
+class AlphabeticallyReorderingColumnPartitionReader(fileReader: PartitionReader[ColumnarBatch],
+                                                    partitionValues: Array[Scalar],
+                                                    partValueTypes: Array[DataType],
+                                                    partitionSchema: StructType,
+                                                    requestedAttributes: Seq[Attribute])
+  extends ColumnarPartitionReaderWithPartitionValues(fileReader,
+                                                     partitionValues,
+                                                     partValueTypes) {
+  override def get(): ColumnarBatch = {
+    val fileBatch: ColumnarBatch = super.get()
+    if (partitionValues.isEmpty) {
+      return fileBatch
+    }
+
+    // super.get() returns columns specified in `requestedAttributes`,
+    // but ordered according to `tableSchema`. Must reorder, based on `requestedAttributes`.
+    // Also, super.get() appends *all* partition keys, even if they do not belong
+    // in the output projection. Must discard unused partition keys here.
+    withResource(fileBatch) { fileBatch =>
+      var dataColumnIndex = 0
+      val partitionColumnStartIndex = fileBatch.numCols() - partitionValues.length
+      val partitionKeys = partitionSchema.map(_.name).toList
+      val reorderedColumns = requestedAttributes.map { a =>
+        val partIndex = partitionKeys.indexOf(a.name)
+        if (partIndex == -1) {
+          // Not a partition column.
+          dataColumnIndex += 1
+          fileBatch.column(dataColumnIndex - 1)
+        }
+        else {
+          // Partition key.
+          fileBatch.column(partitionColumnStartIndex + partIndex)
+        }
+      }.toArray
+      for (col <- reorderedColumns) { col.asInstanceOf[GpuColumnVector].incRefCount() }
+      new ColumnarBatch(reorderedColumns, fileBatch.numRows())
+    }
+  }
+}
+
 // Factory to build the columnar reader.
-case class GpuHiveTextPartitionReaderFactory(
-    sqlConf: SQLConf,
-    broadcastConf: Broadcast[SerializableConfiguration],
-    dataSchema: StructType,
-    partitionSchema: StructType,
-    readSchema: StructType,
-    maxReaderBatchSizeRows: Integer,
-    maxReaderBatchSizeBytes: Long,
-    metrics: Map[String, GpuMetric],
-    @transient options: Map[String, String])
+case class GpuHiveTextPartitionReaderFactory(sqlConf: SQLConf,
+                                             broadcastConf: Broadcast[SerializableConfiguration],
+                                             inputFileSchema: StructType,
+                                             partitionSchema: StructType,
+                                             requestedOutputDataSchema: StructType,
+                                             requestedAttributes: Seq[Attribute],
+                                             maxReaderBatchSizeRows: Integer,
+                                             maxReaderBatchSizeBytes: Long,
+                                             metrics: Map[String, GpuMetric],
+                                             @transient options: Map[String, String])
   extends ShimFilePartitionReaderFactory(options) {
 
   override def buildReader(partitionedFile: PartitionedFile): PartitionReader[InternalRow] = {
@@ -403,26 +419,33 @@ case class GpuHiveTextPartitionReaderFactory(
     val conf = broadcastConf.value.value
     val reader = new PartitionReaderWithBytesRead(
                    new GpuHiveDelimitedTextPartitionReader(
-                     conf, csvOptions, partFile, dataSchema,
-                     readSchema, maxReaderBatchSizeRows,
+                     conf, csvOptions, partFile, inputFileSchema,
+                     requestedOutputDataSchema, maxReaderBatchSizeRows,
                      maxReaderBatchSizeBytes, metrics))
-    ColumnarPartitionReaderWithPartitionValues.newReader(partFile, reader, partitionSchema)
+
+    val partValueScalars = ColumnarPartitionReaderWithPartitionValues.createPartitionValues(
+      partFile.partitionValues.toSeq(partitionSchema),
+      partitionSchema
+    )
+    new AlphabeticallyReorderingColumnPartitionReader(reader,
+                                                      partValueScalars,
+                                                      GpuColumnVector.extractTypes(partitionSchema),
+                                                      partitionSchema,
+                                                      requestedAttributes)
   }
 }
 
 // Reader that converts from chunked data buffers into cudf.Table.
-class GpuHiveDelimitedTextPartitionReader(
-    conf: Configuration,
-    csvOptions: CSVOptions,
-    partFile: PartitionedFile,
-    dataSchema: StructType,
-    readDataSchema: StructType,
-    maxRowsPerChunk: Integer,
-    maxBytesPerChunk: Long,
-    execMetrics: Map[String, GpuMetric]) extends
-  CSVPartitionReader(conf, partFile, dataSchema, readDataSchema,
-                     csvOptions,
-                     maxRowsPerChunk, maxBytesPerChunk, execMetrics) {
+class GpuHiveDelimitedTextPartitionReader(conf: Configuration,
+                                          csvOptions: CSVOptions,
+                                          partFile: PartitionedFile,
+                                          inputFileSchema: StructType,
+                                          requestedOutputDataSchema: StructType,
+                                          maxRowsPerChunk: Integer,
+                                          maxBytesPerChunk: Long,
+                                          execMetrics: Map[String, GpuMetric]) extends
+  CSVPartitionReader(conf, partFile, inputFileSchema, requestedOutputDataSchema,
+                     csvOptions, maxRowsPerChunk, maxBytesPerChunk, execMetrics) {
 
   override def buildCsvOptions(parsedOptions: CSVOptions,
                                schema: StructType,
@@ -431,31 +454,28 @@ class GpuHiveDelimitedTextPartitionReader(
       .withDelim('\u0001')
   }
 
-  // TODO: Remove this. Only for debugging.
-  override def readToTable(
-      dataBuffer: HostMemoryBuffer,
-      dataSize: Long,
-      cudfSchema: Schema,
-      readDataSchema: StructType,
-      isFirstChunk: Boolean): Table = {
-    // cudfSchema == Schema of the input file/buffer.
-    //               Presented in the order of input columns in the file.
-    // readSchema == Spark output schema. This is inexplicably sorted alphabetically
-    //               in HiveTSExec, unlike FileSourceScanExec (which has file-input
-    //               ordering).
-    //               This trips up the downstream string->numeric casts in
-    //               GpuTextBasedPartitionReader.readToTable().
-    // But given that Table.readCsv presents the output columns in the order
-    // of the input file, one option is to the reorder the table read from the input file
-    // in the order specified in readDataSchema (i.e. requiredAttributes).
-    val table = super.readToTable(dataBuffer, dataSize, cudfSchema, readDataSchema, isFirstChunk)
+  override def readToTable(dataBuffer: HostMemoryBuffer,
+                           dataSize: Long,
+                           inputFileCudfSchema: Schema,
+                           requestedOutputDataSchema: StructType,
+                           isFirstChunk: Boolean): Table = {
+    // inputFileCudfSchema       == Schema of the input file/buffer.
+    //                              Presented in the order of input columns in the file.
+    // requestedOutputDataSchema == Spark output schema. This is inexplicably sorted alphabetically
+    //                              in HiveTSExec, unlike FileSourceScanExec (which has file-input
+    //                              ordering).
+    //                              This trips up the downstream string->numeric casts in
+    //                              GpuTextBasedPartitionReader.readToTable().
+    // Given that Table.readCsv presents the output columns in the order of the input file,
+    // we need to reorder the table read from the input file in the order specified in
+    // [[requestedOutputDataSchema]] (i.e. requiredAttributes).
+    val table = super.readToTable(dataBuffer, dataSize, inputFileCudfSchema, requestedOutputDataSchema, isFirstChunk)
     GpuColumnVector.debug("GpuHiveDelimTextPartReader::readToTable(): ", table)
-    // TODO: Rearrange here.
     withResource(table) { table =>
-      val requiredColumnSequence = readDataSchema.map(_.name).toList
+      val requiredColumnSequence = requestedOutputDataSchema.map(_.name).toList
       val requiredColumnSet      = requiredColumnSequence.toSet
-      val outputColumnNames      = cudfSchema.getColumnNames
-                                             .filter(c => requiredColumnSet.contains(c))
+      val outputColumnNames      = inputFileCudfSchema.getColumnNames
+                                                      .filter(c => requiredColumnSet.contains(c))
       val reorderedColumns       = requiredColumnSequence.map(
         colName => table.getColumn(outputColumnNames.indexOf(colName)))
       val reorderedTable         = new Table(reorderedColumns: _*)
