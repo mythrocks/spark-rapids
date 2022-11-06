@@ -34,8 +34,9 @@ import org.apache.spark.sql.catalyst.catalog.HiveTableRelation
 import org.apache.spark.sql.catalyst.csv.CSVOptions
 import org.apache.spark.sql.catalyst.expressions.{And, Attribute, AttributeMap, AttributeReference, AttributeSet, BindReferences, Expression, Literal}
 import org.apache.spark.sql.connector.read.PartitionReader
-import org.apache.spark.sql.execution.{ExecSubqueryExpression, LeafExecNode, PartitionedFileUtil}
+import org.apache.spark.sql.execution.{ExecSubqueryExpression, LeafExecNode, PartitionedFileUtil, SQLExecution}
 import org.apache.spark.sql.execution.datasources.{FilePartition, PartitionDirectory, PartitionedFile}
+import org.apache.spark.sql.execution.metric.SQLMetrics
 import org.apache.spark.sql.hive.client.HiveClientImpl
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{BooleanType, DataType, StructType}
@@ -46,6 +47,7 @@ import java.net.URI
 import java.util.concurrent.TimeUnit.NANOSECONDS
 import scala.collection.JavaConverters._
 import scala.collection.immutable.HashSet
+import scala.collection.mutable
 
 case class GpuHiveTableScanExec(requestedAttributes: Seq[Attribute],
                                 hiveTableRelation: HiveTableRelation,
@@ -155,6 +157,19 @@ case class GpuHiveTableScanExec(requestedAttributes: Seq[Attribute],
     PEAK_DEVICE_MEMORY -> createSizeMetric(MODERATE_LEVEL, DESCRIPTION_PEAK_DEVICE_MEMORY),
     "scanTime" -> createTimingMetric(ESSENTIAL_LEVEL, "scan time")
   ) ++ semaphoreMetrics
+
+  private lazy val driverMetrics: mutable.HashMap[String, Long] = mutable.HashMap.empty
+
+  /**
+   * Send the driver-side metrics. Before calling this function, selectedPartitions has
+   * been initialized. See SPARK-26327 for more details.
+   */
+  private def sendDriverMetrics(): Unit = {
+    driverMetrics.foreach(e => metrics(e._1).add(e._2))
+    val executionId = sparkContext.getLocalProperty(SQLExecution.EXECUTION_ID_KEY)
+    SQLMetrics.postDriverMetricUpdates(sparkContext, executionId,
+      metrics.filter(e => driverMetrics.contains(e._1)).values.toSeq)
+  }
 
   private def buildReader(sqlConf: SQLConf,
                           broadcastConf: Broadcast[SerializableConfiguration],
@@ -286,6 +301,8 @@ case class GpuHiveTableScanExec(requestedAttributes: Seq[Attribute],
   lazy val inputRDD: RDD[InternalRow] = {
     // Assume Delimited text.
     // Note: The populated `options` aren't strictly required for text, currently.
+    //       These are added in case they are required for table read in the future,
+    //       (like with Hive ORC tables).
     val options                   = hiveTableRelation.tableMeta.properties ++
                                     hiveTableRelation.tableMeta.storage.properties
     val hadoopConf                = sparkSession.sessionState.newHadoopConfWithOptions(options)
@@ -294,18 +311,16 @@ case class GpuHiveTableScanExec(requestedAttributes: Seq[Attribute],
     val sqlConf                   = sparkSession.sessionState.conf
     val rapidsConf                = new RapidsConf(sqlConf)
     val requestedOutputDataSchema = getRequestedOutputDataSchema(hiveTableRelation.tableMeta.schema,
-                                                  partitionAttributes,
-                                                  requestedAttributes)
-
-    val reader = buildReader(sqlConf,
-                             broadcastHadoopConf,
-                             rapidsConf,
-                             hiveTableRelation.tableMeta.dataSchema,
-                             hiveTableRelation.tableMeta.partitionSchema,
-                             requestedOutputDataSchema,
-                             options)
-    // TODO: sendDriverMetrics()
-    if (hiveTableRelation.isPartitioned) {
+                                                                 partitionAttributes,
+                                                                 requestedAttributes)
+    val reader                    = buildReader(sqlConf,
+                                                broadcastHadoopConf,
+                                                rapidsConf,
+                                                hiveTableRelation.tableMeta.dataSchema,
+                                                hiveTableRelation.tableMeta.partitionSchema,
+                                                requestedOutputDataSchema,
+                                                options)
+    val rdd = if (hiveTableRelation.isPartitioned) {
       createReadRDDForPartitions(reader, hiveTableRelation, requestedOutputDataSchema,
                                  sparkSession, hadoopConf)
     }
@@ -313,6 +328,8 @@ case class GpuHiveTableScanExec(requestedAttributes: Seq[Attribute],
       createReadRDDForTable(reader, hiveTableRelation, requestedOutputDataSchema,
                             sparkSession, hadoopConf)
     }
+    sendDriverMetrics()
+    rdd
   }
 
   override protected def doExecuteColumnar(): RDD[ColumnarBatch] = {
