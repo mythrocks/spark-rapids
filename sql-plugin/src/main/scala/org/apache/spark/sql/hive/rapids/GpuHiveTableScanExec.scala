@@ -108,7 +108,7 @@ case class GpuHiveTableScanExec(requestedAttributes: Seq[Attribute],
     }
   }
 
-   @transient lazy val prunedPartitions: Seq[HivePartition] = {
+  @transient lazy val prunedPartitions: Seq[HivePartition] = {
     if (hiveTableRelation.prunedPartitions.nonEmpty) {
       val hivePartitions =
         hiveTableRelation.prunedPartitions.get.map(HiveClientImpl.toHivePartition(_, hiveQlTable))
@@ -250,7 +250,8 @@ case class GpuHiveTableScanExec(requestedAttributes: Seq[Attribute],
       FilePartition.getFilePartitions(sparkSession, splitFiles, maxSplitBytes)
     }
 
-    // TODO: Handle small-file optimization. Currently assuming per-file reading.
+    // TODO [future]: Handle small-file optimization.
+    //                Currently assuming per-file reading.
     SparkShimImpl.getFileScanRDD(sparkSession, readFile, filePartitions, readSchema)
   }
 
@@ -262,9 +263,11 @@ case class GpuHiveTableScanExec(requestedAttributes: Seq[Attribute],
                 hadoopConf: Configuration
               ) = {
     val tableLocation: URI = hiveTableRelation.tableMeta.storage.locationUri.getOrElse{
-      throw new UnsupportedOperationException("Table path not found")
+      throw new UnsupportedOperationException("Table path not set.")
     }
-
+    // No need to check if table directory exists.
+    // FileSystem.listStatus() handles this for GpuHiveTableScanExec,
+    // just like for Apache Spark.
     createReadRDDForDirectories(readFile,
                                 Array((tableLocation, InternalRow.empty)),
                                 readSchema,
@@ -281,7 +284,9 @@ case class GpuHiveTableScanExec(requestedAttributes: Seq[Attribute],
               ): RDD[InternalRow] = {
     val partitionColTypes = hiveTableRelation.partitionCols.map(_.dataType)
     val dirsWithPartValues = prunedPartitions.map { p =>
-      // TODO: Check for non-existence.
+      // No need to check if partition directory exists.
+      // FileSystem.listStatus() handles this for GpuHiveTableScanExec,
+      // just like for Apache Spark.
       val uri = p.getDataLocation.toUri
       val partValues: Seq[Any] = {
         p.getValues.asScala.zip(partitionColTypes).map {
@@ -295,7 +300,6 @@ case class GpuHiveTableScanExec(requestedAttributes: Seq[Attribute],
 
     createReadRDDForDirectories(readFile,
       dirsWithPartValues, readSchema, sparkSession, hadoopConf)
-//    throw new UnsupportedOperationException("Partitioned Hive text tables currently unsupported.")
   }
 
   lazy val inputRDD: RDD[InternalRow] = {
@@ -468,7 +472,7 @@ class GpuHiveDelimitedTextPartitionReader(conf: Configuration,
                                schema: StructType,
                                hasHeader: Boolean): ai.rapids.cudf.CSVOptions.Builder = {
     super.buildCsvOptions(parsedOptions, schema, hasHeader)
-      .withDelim('\u0001')
+      .withDelim('\u0001') // Record field delimiter '^A'.
   }
 
   override def readToTable(dataBuffer: HostMemoryBuffer,
