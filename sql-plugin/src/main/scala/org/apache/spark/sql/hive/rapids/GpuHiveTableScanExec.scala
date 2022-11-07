@@ -18,13 +18,20 @@ package org.apache.spark.sql.hive.rapids
 
 import ai.rapids.cudf.{HostMemoryBuffer, Scalar, Schema, Table}
 import com.nvidia.spark.RebaseHelper.withResource
+import com.nvidia.spark.rapids.{ColumnarPartitionReaderWithPartitionValues, CSVPartitionReader, GpuColumnVector, GpuExec, PartitionReaderIterator, PartitionReaderWithBytesRead, RapidsConf}
+import com.nvidia.spark.rapids.GpuMetric
 import com.nvidia.spark.rapids.GpuMetric.{BUFFER_TIME, DEBUG_LEVEL, DESCRIPTION_BUFFER_TIME, DESCRIPTION_FILTER_TIME, DESCRIPTION_GPU_DECODE_TIME, DESCRIPTION_PEAK_DEVICE_MEMORY, ESSENTIAL_LEVEL, FILTER_TIME, GPU_DECODE_TIME, MODERATE_LEVEL, NUM_OUTPUT_ROWS, PEAK_DEVICE_MEMORY}
-import com.nvidia.spark.rapids.{CSVPartitionReader, ColumnarPartitionReaderWithPartitionValues, GpuColumnVector, GpuExec, GpuMetric, PartitionReaderIterator, PartitionReaderWithBytesRead, RapidsConf}
 import com.nvidia.spark.rapids.shims.{ShimFilePartitionReaderFactory, ShimSparkPlan, SparkShimImpl}
+import java.net.URI
+import java.util.concurrent.TimeUnit.NANOSECONDS
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileStatus, Path}
 import org.apache.hadoop.hive.ql.metadata.{Partition => HivePartition}
 import org.apache.hadoop.hive.ql.plan.TableDesc
+import scala.collection.JavaConverters._
+import scala.collection.immutable.HashSet
+import scala.collection.mutable
+
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SparkSession
@@ -43,11 +50,6 @@ import org.apache.spark.sql.types.{BooleanType, DataType, StructType}
 import org.apache.spark.sql.vectorized.ColumnarBatch
 import org.apache.spark.util.SerializableConfiguration
 
-import java.net.URI
-import java.util.concurrent.TimeUnit.NANOSECONDS
-import scala.collection.JavaConverters._
-import scala.collection.immutable.HashSet
-import scala.collection.mutable
 
 case class GpuHiveTableScanExec(requestedAttributes: Seq[Attribute],
                                 hiveTableRelation: HiveTableRelation,
@@ -368,7 +370,7 @@ case class GpuHiveTableScanExec(requestedAttributes: Seq[Attribute],
 }
 
 /**
- * Partition-reader styled similarly to [[ColumnarPartitionReaderWithPartitionValues]],
+ * Partition-reader styled similarly to `ColumnarPartitionReaderWithPartitionValues`,
  * but orders the output columns alphabetically.
  * This is required since the [[GpuHiveTableScanExec.requestedAttributes]] have the columns
  * ordered alphabetically by name, even though the table schema (and hence, the file-schema)
@@ -490,7 +492,8 @@ class GpuHiveDelimitedTextPartitionReader(conf: Configuration,
     // Given that Table.readCsv presents the output columns in the order of the input file,
     // we need to reorder the table read from the input file in the order specified in
     // [[requestedOutputDataSchema]] (i.e. requiredAttributes).
-    val table = super.readToTable(dataBuffer, dataSize, inputFileCudfSchema, requestedOutputDataSchema, isFirstChunk)
+    val table = super.readToTable(dataBuffer, dataSize, inputFileCudfSchema,
+                                  requestedOutputDataSchema, isFirstChunk)
     GpuColumnVector.debug("GpuHiveDelimTextPartReader::readToTable(): ", table)
     withResource(table) { table =>
       val requiredColumnSequence = requestedOutputDataSchema.map(_.name).toList
