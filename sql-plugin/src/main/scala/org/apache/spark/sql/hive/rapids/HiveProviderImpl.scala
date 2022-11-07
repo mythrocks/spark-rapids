@@ -151,48 +151,45 @@ class HiveProviderImpl extends HiveProvider {
               case StructType(_)   => flagUnsupportedType(dataColumn)
               case MapType(_,_,_)  => flagUnsupportedType(dataColumn)
               case BinaryType      => flagUnsupportedType(dataColumn)
-              case _               => // All else are supported.
+              // All else are supported.
+              case _               =>
             }
 
           def flagIfUnsupportedStorageFormat(storage: CatalogStorageFormat): Unit = {
-            val textInputFormat = "org.apache.hadoop.mapred.TextInputFormat"
-            val ignoreKeyOutputFormat = "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat"
-            val lazySimpleSerDe = "org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe"
-            if (  storage.inputFormat.getOrElse("") != textInputFormat
-               || storage.outputFormat.getOrElse("") != ignoreKeyOutputFormat
-               || storage.serde.getOrElse("") != lazySimpleSerDe)
+            val textInputFormat      = "org.apache.hadoop.mapred.TextInputFormat"
+            val ignoreKeyOPFormat    = "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat"
+            val lazySimpleSerDe      = "org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe"
+            val serializationKey     = "serialization.format"
+            val ctrlASeparatedFormat = "1" // Implying '^A' field delimiter.
+            if (  storage.inputFormat.getOrElse("")                  != textInputFormat
+               || storage.outputFormat.getOrElse("")                 != ignoreKeyOPFormat
+               || storage.serde.getOrElse("")                        != lazySimpleSerDe
+               || storage.properties.getOrElse(serializationKey, "") != ctrlASeparatedFormat)
               {
                 willNotWorkOnGpu("Only \'^A\' separated text input is currently supported.")
               }
           }
 
           override def convertToGpu(): GpuExec = {
-//            if (true)
-//            throw new UnsupportedOperationException("CALEB: Not currently implemented.")
-//            else
             GpuHiveTableScanExec(wrapped.requestedAttributes,
                                  wrapped.relation,
                                  wrapped.partitionPruningPred)
           }
 
           override def tagPlanForGpu(): Unit = {
-            // val catalogMetadata = wrapped.relation.tableMeta
             val tableRelation = wrapped.relation
 
             // Bail out for unsupported column types.
-            // tableRelation.tableMeta.schema.foreach(flagIfUnsupportedType)
-            // TODO: Use wrapped.relation.dataCols[i].dataType.
-            //  `schema` includes the partition columns.
-            // TODO: Also check that all partitions are LazySimpleSerDe based.
-            //       For first step, partitioned tables are unsupported.
             tableRelation.dataCols.foreach(flagIfUnsupportedType)
-            flagIfUnsupportedStorageFormat(tableRelation.tableMeta.storage)
 
-            /* TODO: Remove.
+            // Check that the table and all participating partitions
+            // are '^A' separated.
+            flagIfUnsupportedStorageFormat(tableRelation.tableMeta.storage)
             if (tableRelation.isPartitioned) {
-              willNotWorkOnGpu("CALEB: Partitioned tables not currently supported.")
+              tableRelation.prunedPartitions.getOrElse(Seq.empty)
+                                            .map(_.storage)
+                                            .foreach(flagIfUnsupportedStorageFormat)
             }
-             */
           }
         })
     ).collect { case r if r != null => (r.getClassFor.asSubclass(classOf[SparkPlan]), r) }.toMap
