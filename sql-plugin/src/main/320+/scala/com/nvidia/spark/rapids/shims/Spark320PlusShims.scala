@@ -40,6 +40,7 @@ import org.apache.spark.sql.execution.exchange.BroadcastExchangeExec
 import org.apache.spark.sql.execution.joins._
 import org.apache.spark.sql.execution.python._
 import org.apache.spark.sql.execution.window.WindowExecBase
+import org.apache.spark.sql.hive.cdh.HiveOverrides
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.rapids._
 import org.apache.spark.sql.rapids.execution._
@@ -254,7 +255,8 @@ trait Spark320PlusShims extends SparkShims with RebaseShims with Logging {
               childPlans.head.convertIfNeeded()
             )(winPy.partitionSpec)
           }
-        }).disabledByDefault("it only supports row based frame for now")
+        }).disabledByDefault("it only supports row based frame for now"),
+      HiveOverrides.getHiveTableExecRule(),
     ).map(r => (r.getClassFor.asSubclass(classOf[SparkPlan]), r)).toMap
     maps ++ ScanExecShims.execs
   }
