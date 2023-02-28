@@ -13,6 +13,7 @@ import com.databricks.sql.transaction.tahoe.commands.DeltaCommand
 import com.databricks.sql.transaction.tahoe.commands.optimize._
 import com.databricks.sql.transaction.tahoe.files.SQLMetricsReporting
 import com.databricks.sql.transaction.tahoe.sources.DeltaSQLConf
+import com.nvidia.spark.rapids.delta.RapidsDeltaSQLConf
 
 import org.apache.spark.SparkContext
 import org.apache.spark.SparkContext.SPARK_JOB_GROUP_ID
@@ -26,7 +27,8 @@ class GpuOptimizeExecutor(
                         sparkSession: SparkSession,
                         txn: OptimisticTransaction,
                         partitionPredicate: Seq[Expression],
-                        zOrderByColumns: Seq[String])
+                        zOrderByColumns: Seq[String],
+                        prevCommitActions: Seq[Action])
   extends DeltaCommand with SQLMetricsReporting with Serializable {
 
   /** Timestamp to use in [[FileAction]] */
@@ -208,6 +210,103 @@ class GpuOptimizeExecutor(
     val removeFiles = bin.map(f => f.removeWithTimestamp(operationTimestamp, dataChange = false))
     val updates = addFiles ++ removeFiles
     updates
+  }
+
+  type PartitionedBin = (Map[String, String], Seq[AddFile])
+
+  trait OptimizeType {
+    def minNumFiles: Long
+
+    def maxFileSize: Long =
+      sparkSession.sessionState.conf.getConf(DeltaSQLConf.DELTA_OPTIMIZE_MAX_FILE_SIZE)
+
+    def targetFiles: (Seq[AddFile], Seq[AddFile])
+
+    def targetBins(jobs: Seq[PartitionedBin]): Seq[PartitionedBin] = jobs
+  }
+
+  case class Compaction() extends OptimizeType {
+    def minNumFiles: Long = 2
+
+    def targetFiles: (Seq[AddFile], Seq[AddFile]) = {
+      val minFileSize = sparkSession.sessionState.conf.getConf(
+        DeltaSQLConf.DELTA_OPTIMIZE_MIN_FILE_SIZE)
+      require(minFileSize > 0, "minFileSize must be > 0")
+      val candidateFiles = txn.filterFiles(partitionPredicate)
+      val filesToProcess = candidateFiles.filter(_.size < minFileSize)
+      (candidateFiles, filesToProcess)
+    }
+  }
+
+  case class MultiDimOrdering() extends OptimizeType {
+    def minNumFiles: Long = 1
+
+    def targetFiles: (Seq[AddFile], Seq[AddFile]) = {
+      // select all files in case of multi-dimensional clustering
+      val candidateFiles = txn.filterFiles(partitionPredicate)
+      (candidateFiles, candidateFiles)
+    }
+  }
+
+  case class AutoCompaction() extends OptimizeType {
+    def minNumFiles: Long = {
+      val minNumFiles =
+        sparkSession.sessionState.conf.getConf(DeltaSQLConf.DELTA_AUTO_COMPACT_MIN_NUM_FILES)
+      require(minNumFiles > 0, "minNumFiles must be > 0")
+      minNumFiles
+    }
+
+    override def maxFileSize: Long =
+      sparkSession.sessionState.conf.getConf(DeltaSQLConf.DELTA_AUTO_COMPACT_MAX_FILE_SIZE)
+        .getOrElse(128 * 1024 * 1024)
+
+    override def targetFiles: (Seq[AddFile], Seq[AddFile]) = {
+      val autoCompactTarget =
+        sparkSession.sessionState.conf.getConf(RapidsDeltaSQLConf.AUTO_COMPACT_TARGET)
+      // Filter the candidate files according to autoCompact.target config.
+      lazy val addedFiles = prevCommitActions.collect { case a: AddFile => a }
+      val candidateFiles = autoCompactTarget match {
+        case "table" =>
+          txn.filterFiles()
+        case "commit" =>
+          addedFiles
+        case "partition" =>
+          val eligiblePartitions = addedFiles.map(_.partitionValues).toSet
+          txn.filterFiles().filter(f => eligiblePartitions.contains(f.partitionValues))
+        case _ =>
+          logError(s"Invalid config for autoCompact.target: $autoCompactTarget. " +
+            s"Falling back to the default value 'table'.")
+          txn.filterFiles()
+      }
+      val filesToProcess = candidateFiles.filter(_.size < maxFileSize)
+      (candidateFiles, filesToProcess)
+    }
+
+    override def targetBins(jobs: Seq[PartitionedBin]): Seq[PartitionedBin] = {
+      var acc = 0L
+      val maxCompactBytes =
+        sparkSession.sessionState.conf.getConf(RapidsDeltaSQLConf.AUTO_COMPACT_MAX_COMPACT_BYTES)
+      // bins with more files are prior to less files.
+      jobs
+        .sortBy { case (_, filesInBin) => -filesInBin.length }
+        .takeWhile { case (_, filesInBin) =>
+          acc += filesInBin.map(_.size).sum
+          acc <= maxCompactBytes
+        }
+    }
+  }
+
+  object OptimizeType {
+
+    def apply(isMultiDimClustering: Boolean, isAutoCompact: Boolean): OptimizeType = {
+      if (isMultiDimClustering) {
+        MultiDimOrdering()
+      } else if (isAutoCompact) {
+        AutoCompaction()
+      } else {
+        Compaction()
+      }
+    }
   }
 
   /**
