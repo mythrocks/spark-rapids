@@ -279,6 +279,25 @@ class GpuOptimisticTransaction(
     identityTracker.foreach { tracker =>
       updatedIdentityHighWaterMarks.appendAll(tracker.highWaterMarks.toSeq)
     }
-    resultFiles.toSeq ++ committer.changeFiles
+    val fileActions = resultFiles.toSeq ++ committer.changeFiles
+
+    // Check if auto-compaction is enabled.
+    lazy val autoCompactEnabled =
+      spark.sessionState.conf
+        .getConf[String](DeltaSQLConf.DELTA_AUTO_COMPACT_ENABLED)
+        .getOrElse {
+//          DeltaConfigs.AUTO_COMPACT.fromMetaData(metadata)
+          "false" // TODO: Fix getting this from DeltaConfigs.AUTO_COMPACT.
+        }.toBoolean
+
+    if (!isOptimize && autoCompactEnabled && fileActions.nonEmpty) {
+      println("CALEB: Sequence accepted! Registering Post Commit Hook!")
+      registerPostCommitHook(GpuDoAutoCompaction)
+    }
+    else {
+      println("CALEB: Sequence not accepted. Skipping Post Commit Hook registration.")
+    }
+
+    fileActions
   }
 }
