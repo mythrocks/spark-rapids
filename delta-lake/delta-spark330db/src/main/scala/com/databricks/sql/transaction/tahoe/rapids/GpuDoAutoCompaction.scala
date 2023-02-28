@@ -18,5 +18,7 @@ object GpuDoAutoCompaction extends PostCommitHook
                    postCommitSnapshot: Snapshot,
                    committedActions: Seq[Action]): Unit = {
     new Exception("CALEB: GpuDoAutoCompaction::run()!").printStackTrace()
+    println(s"CALEB: txn type: ${txn.getClass}")
+
   }
 }
