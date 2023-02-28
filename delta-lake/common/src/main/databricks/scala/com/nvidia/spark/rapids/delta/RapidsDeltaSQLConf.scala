@@ -39,6 +39,13 @@ trait RapidsDeltaSQLConf {
         .doc("Factor used to rebalance partitions for optimize write.")
         .doubleConf
         .createWithDefault(1.2)
+
+//  val AUTO_COMPACT_ENABLED =
+//    DeltaSQLConf.buildConf("autoCompact.enabled")
+//      .internal()
+//      .doc("Enables auto compaction after table update.")
+//      .booleanConf
+//      .createOptional
 }
 
 object RapidsDeltaSQLConf extends RapidsDeltaSQLConf
