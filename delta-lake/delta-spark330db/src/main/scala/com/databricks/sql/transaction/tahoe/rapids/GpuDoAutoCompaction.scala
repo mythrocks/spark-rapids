@@ -17,7 +17,7 @@ object GpuDoAutoCompaction extends PostCommitHook
                    committedVersion: Long,
                    postCommitSnapshot: Snapshot,
                    committedActions: Seq[Action]): Unit = {
-    new Exception("CALEB: GpuDoAutoCompaction::run()!").printStackTrace()
+//    new Exception("CALEB: GpuDoAutoCompaction::run()!").printStackTrace()
     println(s"CALEB: txn type: ${txn.getClass}")
     val newTxn = txn.deltaLog.startTransaction()
     new GpuOptimizeExecutor(spark, newTxn, Seq.empty, Seq.empty, committedActions).optimize()

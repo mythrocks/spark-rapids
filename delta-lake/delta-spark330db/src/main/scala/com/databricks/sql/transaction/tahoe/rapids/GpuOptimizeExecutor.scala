@@ -35,24 +35,26 @@ class GpuOptimizeExecutor(
   private val operationTimestamp = new SystemClock().getTimeMillis()
 
   private val isMultiDimClustering = zOrderByColumns.nonEmpty
+  private val isAutoCompact = prevCommitActions.nonEmpty
+  private val optimizeType = OptimizeType(isMultiDimClustering, isAutoCompact)
 
   def optimize(): Seq[Row] = {
     recordDeltaOperation(txn.deltaLog, "delta.optimize") {
-      val minFileSize = sparkSession.sessionState.conf.getConf(
-        DeltaSQLConf.DELTA_OPTIMIZE_MIN_FILE_SIZE)
-      val maxFileSize = sparkSession.sessionState.conf.getConf(
-        DeltaSQLConf.DELTA_OPTIMIZE_MAX_FILE_SIZE)
-      require(minFileSize > 0, "minFileSize must be > 0")
+      val maxFileSize = optimizeType.maxFileSize
       require(maxFileSize > 0, "maxFileSize must be > 0")
 
-      val candidateFiles = txn.filterFiles(partitionPredicate)
+      val minNumFilesInDir = optimizeType.minNumFiles
+      val (candidateFiles, filesToProcess) = optimizeType.targetFiles
       val partitionSchema = txn.metadata.partitionSchema
 
       // select all files in case of multi-dimensional clustering
-      val filesToProcess = candidateFiles.filter(_.size < minFileSize || isMultiDimClustering)
-      val partitionsToCompact = filesToProcess.groupBy(_.partitionValues).toSeq
+      val partitionsToCompact = filesToProcess
+        .groupBy(_.partitionValues)
+        .filter { case (_, filesInPartition) => filesInPartition.size >= minNumFilesInDir }
+        .toSeq
 
-      val jobs = groupFilesIntoBins(partitionsToCompact, maxFileSize)
+      val groupedJobs = groupFilesIntoBins(partitionsToCompact, maxFileSize)
+      val jobs = optimizeType.targetBins(groupedJobs)
 
       val maxThreads =
         sparkSession.sessionState.conf.getConf(DeltaSQLConf.DELTA_OPTIMIZE_MAX_THREADS)
@@ -253,6 +255,7 @@ class GpuOptimizeExecutor(
       val minNumFiles =
         sparkSession.sessionState.conf.getConf(DeltaSQLConf.DELTA_AUTO_COMPACT_MIN_NUM_FILES)
       require(minNumFiles > 0, "minNumFiles must be > 0")
+      println(s"CALEB: DELTA_AUTO_COMPACT_MIN_NUM_FILES: ${minNumFiles}")
       minNumFiles
     }
 
@@ -299,6 +302,7 @@ class GpuOptimizeExecutor(
   object OptimizeType {
 
     def apply(isMultiDimClustering: Boolean, isAutoCompact: Boolean): OptimizeType = {
+      new Exception("CALEB: object OptimizeType::apply()").printStackTrace()
       if (isMultiDimClustering) {
         MultiDimOrdering()
       } else if (isAutoCompact) {

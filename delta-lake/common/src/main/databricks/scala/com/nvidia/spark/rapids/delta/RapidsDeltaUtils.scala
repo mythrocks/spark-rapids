@@ -55,7 +55,7 @@ object RapidsDeltaUtils {
       }
     }
 
-    new Exception("CALEB: RapidsDeltaUtils::checkIncompatibleConfs()").printStackTrace()
+//    new Exception("CALEB: RapidsDeltaUtils::checkIncompatibleConfs()").printStackTrace()
 
     // Optimized writes for non-partitioned tables involves a round-robin partitioning, and that
     // can involve a sort on all columns. The GPU doesn't currently support sorting on all types,
