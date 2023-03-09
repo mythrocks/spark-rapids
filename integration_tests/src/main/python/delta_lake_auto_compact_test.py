@@ -14,19 +14,22 @@
 
 import pytest
 from asserts import assert_gpu_and_cpu_writes_are_equal_collect
+from delta.tables import DeltaTable
 from delta_lake_write_test import delta_meta_allow
 from marks import allow_non_gpu, delta_lake
+from pyspark.sql.functions import *
 from spark_session import is_databricks104_or_later
 
 _conf = {'spark.rapids.sql.explain': 'ALL',
-         'spark.databricks.delta.autoCompact.enabled': 'true',
-         'spark.databricks.delta.autoCompact.minNumFiles': 3}
+         'spark.databricks.delta.autoCompact.enabled': 'true',  # Enable auto compaction.
+         'spark.databricks.delta.autoCompact.minNumFiles': 3}   # Num files before compaction.
 
 
 @delta_lake
 @allow_non_gpu(*delta_meta_allow)
 @pytest.mark.skipif(not is_databricks104_or_later(),
-                    reason="Auto compaction of Delta Lake tables is only supported on Databricks 10.4")
+                    reason="Auto compaction of Delta Lake tables is only supported "
+                           "on Databricks 10.4+")
 def test_auto_compact(spark_tmp_path):
 
     data_path = spark_tmp_path + "/AUTO_COMPACT_TEST_DATA"
@@ -40,10 +43,28 @@ def test_auto_compact(spark_tmp_path):
         writer.save(table_path)  # <-- Auto compact on 3.
 
     def read_data(spark, table_path):
-        return spark.read.format("delta").load(table_path).repartition(1)
+        return spark.read.format("delta").load(table_path)
+
+    def read_metadata(spark, table_path):
+        input_table = DeltaTable.forPath(spark, table_path)
+        table_history = input_table.history()
+        return table_history.select(
+            "version",
+            "operation",
+            expr("operationMetrics[\"numFiles\"]"),
+            expr("operationMetrics[\"numFiles\"]"),
+            expr("operationMetrics[\"numRemovedFiles\"]"),
+            expr("operationMetrics[\"numAddedFiles\"]")
+        )
 
     assert_gpu_and_cpu_writes_are_equal_collect(
         write_func=write_to_delta,
         read_func=read_data,
+        base_path=data_path,
+        conf=_conf)
+
+    assert_gpu_and_cpu_writes_are_equal_collect(
+        write_func=write_to_delta,
+        read_func=read_metadata,
         base_path=data_path,
         conf=_conf)
