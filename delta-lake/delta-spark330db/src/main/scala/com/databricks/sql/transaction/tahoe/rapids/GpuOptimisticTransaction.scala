@@ -282,20 +282,18 @@ class GpuOptimisticTransaction(
     val fileActions = resultFiles.toSeq ++ committer.changeFiles
 
     // Check if auto-compaction is enabled.
+    // (Auto compaction checks are derived from the work in
+    //  https://github.com/delta-io/delta/pull/1156).
     lazy val autoCompactEnabled =
       spark.sessionState.conf
         .getConf[String](DeltaSQLConf.DELTA_AUTO_COMPACT_ENABLED)
         .getOrElse {
-//          DeltaConfigs.AUTO_COMPACT.fromMetaData(metadata)
+        //  DeltaConfigs.AUTO_COMPACT.fromMetaData(metadata)
           "false" // TODO: Fix getting this from DeltaConfigs.AUTO_COMPACT.
         }.toBoolean
 
     if (!isOptimize && autoCompactEnabled && fileActions.nonEmpty) {
-      println("CALEB: Sequence accepted! Registering Post Commit Hook!")
       registerPostCommitHook(GpuDoAutoCompaction)
-    }
-    else {
-      println("CALEB: Sequence not accepted. Skipping Post Commit Hook registration.")
     }
 
     fileActions

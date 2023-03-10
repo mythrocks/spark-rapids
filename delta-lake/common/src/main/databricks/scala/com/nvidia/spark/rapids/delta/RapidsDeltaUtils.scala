@@ -55,8 +55,6 @@ object RapidsDeltaUtils {
       }
     }
 
-//    new Exception("CALEB: RapidsDeltaUtils::checkIncompatibleConfs()").printStackTrace()
-
     // Optimized writes for non-partitioned tables involves a round-robin partitioning, and that
     // can involve a sort on all columns. The GPU doesn't currently support sorting on all types,
     // so we fallback if the GPU cannot support the round-robin partitioning.
@@ -92,16 +90,5 @@ object RapidsDeltaUtils {
         }
       }
     }
-
-    val autoCompactEnabled =
-      getSQLConf("spark.databricks.delta.autoCompact.enabled").orElse {
-        val metadata = deltaLog.snapshot.metadata
-        metadata.configuration.get("delta.autoOptimize.autoCompact").orElse {
-          getSQLConf("spark.databricks.delta.properties.defaults.autoOptimize.autoCompact")
-        }
-      }.exists(_.toBoolean)
-//    if (autoCompactEnabled) {
-//      meta.willNotWorkOnGpu("automatic compaction of Delta Lake tables is not supported")
-//    }
   }
 }
