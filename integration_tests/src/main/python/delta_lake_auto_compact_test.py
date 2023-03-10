@@ -52,7 +52,6 @@ def test_auto_compact(spark_tmp_path):
             "version",
             "operation",
             expr("operationMetrics[\"numFiles\"]"),
-            expr("operationMetrics[\"numFiles\"]"),
             expr("operationMetrics[\"numRemovedFiles\"]"),
             expr("operationMetrics[\"numAddedFiles\"]")
         )
