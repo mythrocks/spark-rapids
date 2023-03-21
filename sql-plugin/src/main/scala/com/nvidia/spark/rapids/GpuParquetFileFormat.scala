@@ -276,7 +276,7 @@ class GpuParquetFileFormat extends ColumnarFileFormat with Logging {
       }
 
       override def getFileExtension(context: TaskAttemptContext): String = {
-        CodecConfig.from(context).getCodec.getExtension + ".parquet"
+        CodecConfig.from(context).getCodec.getExtension + ".gpu.parquet"
       }
     }
   }

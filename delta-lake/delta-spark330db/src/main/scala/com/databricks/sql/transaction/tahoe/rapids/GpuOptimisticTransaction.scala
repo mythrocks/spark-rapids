@@ -29,6 +29,7 @@ import ai.rapids.cudf.ColumnView
 import com.databricks.sql.transaction.tahoe._
 import com.databricks.sql.transaction.tahoe.actions.{AddFile, FileAction}
 import com.databricks.sql.transaction.tahoe.constraints.{Constraint, Constraints}
+import com.databricks.sql.transaction.tahoe.hooks.rapids.GpuDoAutoCompactionNew
 import com.databricks.sql.transaction.tahoe.schema.InvariantViolationException
 import com.databricks.sql.transaction.tahoe.sources.DeltaSQLConf
 import com.nvidia.spark.rapids._
@@ -293,7 +294,12 @@ class GpuOptimisticTransaction(
         }.toBoolean
 
     if (!isOptimize && autoCompactEnabled && fileActions.nonEmpty) {
-      registerPostCommitHook(GpuDoAutoCompaction)
+      if (spark.conf.get("spark.rapids.delta.autoCompact.useOptimizeExecutor", "true") == "true") {
+        registerPostCommitHook(GpuDoAutoCompaction)
+      }
+      else {
+        registerPostCommitHook(GpuDoAutoCompactionNew)
+      }
     }
 
     fileActions

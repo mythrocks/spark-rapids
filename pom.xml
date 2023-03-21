@@ -73,7 +73,6 @@
         <profile>
             <id>release311</id>
             <activation>
-                <activeByDefault>true</activeByDefault>
                 <property>
                     <name>buildver</name>
                     <value>311</value>
@@ -524,6 +523,7 @@
             <!-- Note that 330db backports many features from Spark3.4.0 -->
             <id>release330db</id>
             <activation>
+                <activeByDefault>true</activeByDefault>
                 <property>
                     <name>buildver</name>
                     <value>330db</value>

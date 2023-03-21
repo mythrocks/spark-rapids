@@ -20,20 +20,20 @@
  * limitations under the License.
  */
 
-package com.databricks.sql.transaction.tahoe.rapids
+package com.databricks.sql.transaction.tahoe.hooks.rapids
 
 import com.databricks.sql.transaction.tahoe._
 import com.databricks.sql.transaction.tahoe.actions.Action
-import com.databricks.sql.transaction.tahoe.commands.OptimizeExecutor
-import com.databricks.sql.transaction.tahoe.hooks.PostCommitHook
+import com.databricks.sql.transaction.tahoe.hooks.{AutoCompact, PostCommitHook}
 import com.databricks.sql.transaction.tahoe.metering.DeltaLogging
+import com.databricks.sql.transaction.tahoe.rapids._
 
 import org.apache.spark.sql.SparkSession
 
-object GpuDoAutoCompaction extends PostCommitHook
+object GpuDoAutoCompactionNew extends PostCommitHook
     with DeltaLogging
     with Serializable {
-  override val name: String = "GpuDoAutoCompaction"
+  override val name: String = "GpuDoAutoCompactionNew"
 
   override def run(spark: SparkSession,
                    txn: OptimisticTransactionImpl,
@@ -42,7 +42,8 @@ object GpuDoAutoCompaction extends PostCommitHook
                    committedActions: Seq[Action]): Unit = {
     val gpuTxn = txn.asInstanceOf[GpuOptimisticTransaction]
     val newTxn = new GpuDeltaLog(gpuTxn.deltaLog, gpuTxn.rapidsConf).startTransaction()
-    new OptimizeExecutor(spark, newTxn, Seq.empty, Seq.empty).optimize()
+//    new OptimizeExecutor(spark, newTxn, Seq.empty, Seq.empty).optimize()
+    AutoCompact.run(spark, newTxn, committedVersion, postCommitSnapshot, committedActions)
   }
 
   override def handleError(error: Throwable, version: Long): Unit =
