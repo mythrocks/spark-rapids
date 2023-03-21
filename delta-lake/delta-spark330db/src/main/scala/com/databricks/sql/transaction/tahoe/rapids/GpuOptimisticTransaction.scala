@@ -294,11 +294,11 @@ class GpuOptimisticTransaction(
         }.toBoolean
 
     if (!isOptimize && autoCompactEnabled && fileActions.nonEmpty) {
-      if (spark.conf.get("spark.rapids.delta.autoCompact.useOptimizeExecutor", "true") == "true") {
-        registerPostCommitHook(GpuDoAutoCompaction)
+      if (spark.conf.get("spark.rapids.delta.autoCompact.useNew", "true") == "true") {
+        registerPostCommitHook(GpuDoAutoCompactionNew)
       }
       else {
-        registerPostCommitHook(GpuDoAutoCompactionNew)
+        registerPostCommitHook(GpuDoAutoCompaction)
       }
     }
 

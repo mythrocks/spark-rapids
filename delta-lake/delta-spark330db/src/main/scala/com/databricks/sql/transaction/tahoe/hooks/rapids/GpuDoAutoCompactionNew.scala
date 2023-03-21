@@ -24,7 +24,7 @@ package com.databricks.sql.transaction.tahoe.hooks.rapids
 
 import com.databricks.sql.transaction.tahoe._
 import com.databricks.sql.transaction.tahoe.actions.Action
-import com.databricks.sql.transaction.tahoe.hooks.{AutoCompact, PostCommitHook}
+import com.databricks.sql.transaction.tahoe.hooks.{AutoCompact, AutoCompactUtils, PostCommitHook}
 import com.databricks.sql.transaction.tahoe.metering.DeltaLogging
 import com.databricks.sql.transaction.tahoe.rapids._
 
@@ -43,7 +43,20 @@ object GpuDoAutoCompactionNew extends PostCommitHook
     val gpuTxn = txn.asInstanceOf[GpuOptimisticTransaction]
     val newTxn = new GpuDeltaLog(gpuTxn.deltaLog, gpuTxn.rapidsConf).startTransaction()
 //    new OptimizeExecutor(spark, newTxn, Seq.empty, Seq.empty).optimize()
-    AutoCompact.run(spark, newTxn, committedVersion, postCommitSnapshot, committedActions)
+    val compactType = AutoCompact.getAutoCompactType(spark.sessionState.conf, postCommitSnapshot.metadata)
+    if (compactType.nonEmpty) {
+      val qualified = AutoCompactUtils.isQualifiedForAutoCompact(spark, txn)
+      println(s"CALEB: Qualified for auto-compact? ${qualified}")
+      println(s"CALEB: isUCManagedTable: ${newTxn.deltaLog.isUCManagedTable}")
+      val actualCompactType = compactType.get
+      println(s"CALEB: compactType shouldRunInBackground? ${actualCompactType.shouldRunInBackground}")
+      println(s"CALEB: AutoCompact OP_TYPE == ${AutoCompact.OP_TYPE}")
+//      val req = AutoCompactUtils.constructAutoCompactRequest(spark, newTxn,
+//        postCommitSnapshot, AutoCompact.OP_TYPE, false) // Crashes
+//      println(s"CALEB: AutoCompactRequest shouldCompact(): ${req.shouldCompact}")
+    }
+    // AutoCompact.run(spark, newTxn, committedVersion, postCommitSnapshot, committedActions) // No compact.
+    AutoCompact.run(spark, txn, committedVersion, postCommitSnapshot, committedActions) // No gpuWrite
   }
 
   override def handleError(error: Throwable, version: Long): Unit =
