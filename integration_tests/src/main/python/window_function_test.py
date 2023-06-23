@@ -73,6 +73,11 @@ _grpkey_longs_with_nullable_largest_decimals = [
     ('b', DecimalGen(precision=38, scale=2, nullable=True)),
     ('c', DecimalGen(precision=38, scale=2, nullable=True))]
 
+_grpkey_longs_with_nullable_floats = [
+    ('a', RepeatSeqGen(LongGen(nullable=(True, 10.0)), length=20)),
+    ('b', FloatGen(nullable=True)),
+    ('c', IntegerGen(nullable=True))]
+
 _grpkey_decimals_with_nulls = [
     ('a', RepeatSeqGen(LongGen(nullable=(True, 10.0)), length=20)),
     ('b', IntegerGen()),
@@ -910,6 +915,40 @@ def test_window_aggregations_for_decimal_ranges(data_gen):
         ' MAX(c)   OVER (PARTITION BY a ORDER BY b RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW), '
         ' RANK()   OVER (PARTITION BY a ORDER BY b) '
         'FROM window_agg_table',
+        conf={})
+
+
+# In a distributed setup the order of the partitions returned might be different, so we must ignore the order
+# but small batch sizes can make sort very slow, so do the final order by locally
+@ignore_order(local=True)
+@pytest.mark.parametrize('data_gen', [
+    _grpkey_longs_with_nullable_floats,
+], ids=idfn)
+def test_window_aggregations_for_float_ranges(data_gen):
+    """
+    Tests for range window aggregations, with DECIMAL order by columns.
+    The table schema used:
+      a: Group By column
+      b: Order By column (float)
+      c: Aggregation column
+
+    Since this test is for the order-by column type, and not for each specific windowing aggregation,
+    we use COUNT(1) throughout the test, for different window widths and ordering.
+    Some other aggregation functions are thrown in for variety.
+    """
+
+    def gen_write_and_get_df(spark):
+        df = gen_df(spark, data_gen, length=128)
+        # df.write.orc("/tmp/float_window_test")
+        return df
+
+    assert_gpu_and_cpu_are_equal_sql(
+        # lambda spark: gen_df(spark, data_gen, length=128),
+        gen_write_and_get_df,
+        "window_agg_table",
+        'SELECT '
+        ' COUNT(1) OVER (PARTITION BY a ORDER BY b ASC RANGE BETWEEN 10 PRECEDING AND 6 FOLLOWING) d '
+        ' FROM window_agg_table',
         conf={})
 
 
