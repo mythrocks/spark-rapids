@@ -797,6 +797,8 @@ def test_parquet_read_nano_as_longs_true(std_input_path):
         'FileSourceScanExec',
         conf=conf)
 
+
+@disable_ansi_mode  # https://github.com/NVIDIA/spark-rapids/issues/5114
 def test_many_column_project():
     def _create_wide_data_frame(spark, num_cols):
         schema_dict = {}
