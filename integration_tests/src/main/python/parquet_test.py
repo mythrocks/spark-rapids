@@ -1289,26 +1289,63 @@ def test_parquet_read_case_insensitivity(spark_tmp_path):
     )
 
 
-# test read INT32 as INT8/INT16/Date
-@pytest.mark.parametrize('reader_confs', reader_opt_confs)
-@pytest.mark.parametrize('v1_enabled_list', ["", "parquet"])
-def test_parquet_int32_downcast(spark_tmp_path, reader_confs, v1_enabled_list):
+def run_test_parquet_int32_downcast(spark_tmp_path,
+                                    reader_confs,
+                                    v1_enabled_list,
+                                    ansi_conf):
+    """
+    This tests whether Parquet files with columns written as INT32 can be
+    read as having INT8, INT16 and DATE columns, with ANSI mode enabled/disabled.
+    """
     data_path = spark_tmp_path + '/PARQUET_DATA'
     write_schema = [("d", date_gen), ('s', short_gen), ('b', byte_gen)]
+
+    # For test setup, write with ANSI disabled.
+    # Otherwise, CAST(d AS INT) will fail on Spark CPU.
     with_cpu_session(
         lambda spark: gen_df(spark, write_schema).selectExpr(
             "cast(d as Int) as d",
             "cast(s as Int) as s",
-            "cast(b as Int) as b").write.parquet(data_path))
+            "cast(b as Int) as b").write.parquet(data_path), conf=ansi_disabled_conf)
 
     read_schema = StructType([StructField("d", DateType()),
                               StructField("s", ShortType()),
                               StructField("b", ByteType())])
     conf = copy_and_update(reader_confs,
-                           {'spark.sql.sources.useV1SourceList': v1_enabled_list})
+                           {'spark.sql.sources.useV1SourceList': v1_enabled_list},
+                           ansi_conf)
     assert_gpu_and_cpu_are_equal_collect(
         lambda spark: spark.read.schema(read_schema).parquet(data_path),
         conf=conf)
+
+
+@pytest.mark.parametrize('reader_confs', reader_opt_confs)
+@pytest.mark.parametrize('v1_enabled_list', ["", "parquet"])
+def test_parquet_int32_downcast_ansi_disabled(spark_tmp_path, reader_confs, v1_enabled_list):
+    """
+    This tests whether Parquet files with columns written as INT32 can be
+    read as having INT8, INT16 and DATE columns, with ANSI mode disabled.
+    """
+    run_test_parquet_int32_downcast(spark_tmp_path,
+                                    reader_confs,
+                                    v1_enabled_list,
+                                    ansi_disabled_conf)
+
+
+def test_parquet_int32_downcast_ansi_enabled(spark_tmp_path):
+    """
+    This is the flipside of test_parquet_int32_downcast_ansi_disabled.
+    This tests whether Parquet files with columns written as INT32 can be
+    read as having INT8, INT16 and DATE columns, now tested with ANSI
+    enabled.
+    A limited combination of test parameters is used to test ANSI enabled,
+    in the interest of brevity.
+    """
+    run_test_parquet_int32_downcast(spark_tmp_path,
+                                    reader_confs=native_parquet_file_reader_conf,
+                                    v1_enabled_list="",
+                                    ansi_conf=ansi_disabled_conf)
+
 
 @pytest.mark.parametrize('reader_confs', reader_opt_confs)
 @pytest.mark.parametrize('v1_enabled_list', ["", "parquet"])
