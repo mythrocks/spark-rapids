@@ -485,6 +485,8 @@ def test_parquet_read_buffer_allocation_empty_blocks(spark_tmp_path, v1_enabled_
             lambda spark : spark.read.parquet(data_path).filter("id < 2 or id > 990"),
             conf=all_confs)
 
+
+@disable_ansi_mode  # https://github.com/NVIDIA/spark-rapids/issues/5114
 @pytest.mark.parametrize('reader_confs', reader_opt_confs)
 @pytest.mark.parametrize('v1_enabled_list', ["", "parquet"])
 @pytest.mark.skipif(is_databricks_runtime(), reason="https://github.com/NVIDIA/spark-rapids/issues/7733")
@@ -1436,13 +1438,16 @@ def test_parquet_read_encryption(spark_tmp_path, reader_confs, v1_enabled_list):
     assert_spark_exception(
         lambda: with_gpu_session(
             lambda spark: spark.read.parquet(data_path).collect()),
-        error_message='Could not read footer for file')
+        error_message='Could not read footer')  # Common message fragment between all Spark versions.
+                                                # Note that this isn't thrown explicitly by the plugin.
 
     assert_spark_exception(
         lambda: with_gpu_session(
             lambda spark: spark.read.parquet(data_path).collect(), conf=conf),
         error_message='The GPU does not support reading encrypted Parquet files')
 
+
+@disable_ansi_mode  # https://github.com/NVIDIA/spark-rapids/issues/5114
 def test_parquet_read_count(spark_tmp_path):
     parquet_gens = [int_gen, string_gen, double_gen]
     gen_list = [('_c' + str(i), gen) for i, gen in enumerate(parquet_gens)]
