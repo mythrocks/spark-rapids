@@ -16,15 +16,8 @@
 
 /*** spark-rapids-shim-json-lines
 {"spark": "341db"}
-{"spark": "350db"}
 spark-rapids-shim-json-lines ***/
 package org.apache.spark.sql.rapids.shims
 
-import org.apache.spark.sql.errors.QueryExecutionErrors
-
-object RapidsErrorUtils extends RapidsErrorUtilsBase
-  with RapidsQueryErrorUtils with SequenceSizeTooLongErrorBuilder {
-  def sqlArrayIndexNotStartAtOneError(): RuntimeException = {
-    QueryExecutionErrors.invalidIndexOfZeroError(context = null)
-  }
-}
+object RapidsErrorUtils extends RapidsErrorUtils341DBBase
+  with SequenceSizeTooLongErrorBuilder

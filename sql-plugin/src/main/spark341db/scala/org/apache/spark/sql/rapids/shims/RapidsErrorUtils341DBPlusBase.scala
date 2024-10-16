@@ -15,22 +15,16 @@
  */
 
 /*** spark-rapids-shim-json-lines
-{"spark": "334"}
-{"spark": "342"}
-{"spark": "343"}
+{"spark": "341db"}
 {"spark": "350db"}
-{"spark": "351"}
-{"spark": "352"}
 spark-rapids-shim-json-lines ***/
 package org.apache.spark.sql.rapids.shims
 
-import org.apache.spark.unsafe.array.ByteArrayMethods.MAX_ROUNDED_ARRAY_LENGTH
+import org.apache.spark.sql.errors.QueryExecutionErrors
 
-trait SequenceSizeTooLongUnsuccessfulErrorBuilder {
-  def getTooLongSequenceErrorString(sequenceSize: Int, functionName: String): String = {
-    // The errant function's name does not feature in the exception message
-    // prior to Spark 4.0.  Neither does the attempted allocation size.
-    "Unsuccessful try to create array with elements exceeding the array " +
-      s"size limit $MAX_ROUNDED_ARRAY_LENGTH"
+trait RapidsErrorUtils341DBPlusBase extends RapidsErrorUtilsBase
+  with RapidsQueryErrorUtils {
+  def sqlArrayIndexNotStartAtOneError(): RuntimeException = {
+    QueryExecutionErrors.invalidIndexOfZeroError(context = null)
   }
 }
