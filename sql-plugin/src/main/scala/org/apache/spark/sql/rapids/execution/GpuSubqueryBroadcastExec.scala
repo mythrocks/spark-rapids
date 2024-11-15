@@ -34,6 +34,7 @@ import org.apache.spark.sql.catalyst.plans.QueryPlan
 import org.apache.spark.sql.catalyst.plans.physical.IdentityBroadcastMode
 import org.apache.spark.sql.execution.{SparkPlan, SQLExecution, SubqueryBroadcastExec}
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec
+import org.apache.spark.sql.execution.CollectLimitExec
 import org.apache.spark.sql.execution.exchange.BroadcastExchangeExec
 import org.apache.spark.sql.execution.joins.{HashedRelationBroadcastMode, HashJoin}
 import org.apache.spark.sql.internal.{SQLConf, StaticSQLConf}
@@ -54,7 +55,16 @@ abstract class GpuSubqueryBroadcastMetaBase(
 
   override val childPlans: Seq[SparkPlanMeta[SparkPlan]] = Nil
 
-  override def tagPlanForGpu(): Unit = s.child match {
+  def plan_print(plan: SparkPlan, level: Int): Unit = {
+    Range(0, level).foreach(_ => System.out.print(" "))
+    System.out.println(s"CALEB: -> ${plan.getClass.getName}")
+    plan.children.map(plan_print(_, level+1))
+  }
+
+  override def tagPlanForGpu(): Unit = {
+    plan_print(s, 0)
+    s.child match {
+
 
     // For AQE off:
     //
@@ -126,13 +136,21 @@ abstract class GpuSubqueryBroadcastMetaBase(
           } else {
             willNotWorkOnGpu("underlying BroadcastExchange can not run in the GPU.")
           }
-        case _ =>
-          throw new AssertionError("should not reach here")
+
+        case collectLimit: CollectLimitExec =>
+          val collectChild = collectLimit.child
+          System.out.println("CALEB: Found CollectLimit!")
+          plan_print(collectChild, 0)
+          System.out.println("CALEB: Done printing. And now, we explode.")
+          throw new AssertionError(s"CALEB: Received collect child: ${collectChild.getClass.getName}")
+
+        case unexpected =>
+          throw new AssertionError(s"CALEB: Did not expect: ${unexpected.getClass.getName}")
       }
 
     case _ =>
       willNotWorkOnGpu("the subquery to broadcast can not entirely run in the GPU.")
-  }
+  }}
 
   /**
    * Simply returns the original plan. Because its only child, BroadcastExchange, doesn't
