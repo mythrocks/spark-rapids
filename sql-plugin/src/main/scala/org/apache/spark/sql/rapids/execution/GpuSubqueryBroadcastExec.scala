@@ -34,6 +34,7 @@ import org.apache.spark.sql.catalyst.plans.QueryPlan
 import org.apache.spark.sql.catalyst.plans.physical.IdentityBroadcastMode
 import org.apache.spark.sql.execution.{SparkPlan, SQLExecution, SubqueryBroadcastExec}
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec
+import org.apache.spark.sql.execution.CollectLimitExec
 import org.apache.spark.sql.execution.exchange.BroadcastExchangeExec
 import org.apache.spark.sql.execution.joins.{HashedRelationBroadcastMode, HashJoin}
 import org.apache.spark.sql.internal.{SQLConf, StaticSQLConf}
@@ -126,8 +127,13 @@ abstract class GpuSubqueryBroadcastMetaBase(
           } else {
             willNotWorkOnGpu("underlying BroadcastExchange can not run in the GPU.")
           }
-        case _ =>
-          throw new AssertionError("should not reach here")
+
+        case collectLimit: CollectLimitExec =>
+          val collectChild = collectLimit.child
+          throw new AssertionError(s"CALEB: Received collect child: ${collectChild.getClass.getName}")
+
+        case unexpected =>
+          throw new AssertionError(s"CALEB: Did not expect: ${unexpected.getClass.getName}")
       }
 
     case _ =>
