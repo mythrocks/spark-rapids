@@ -343,7 +343,7 @@ aqe_join_with_dpp_fallback=["FilterExec"] if (is_databricks_runtime() or is_befo
 @ignore_order(local=True)
 @allow_non_gpu(*aqe_join_with_dpp_fallback)
 def test_aqe_join_with_dpp(spark_tmp_path):
-    data_path = "/tmp/myth" + '/PARQUET_DATA'
+    data_path = spark_tmp_path + '/PARQUET_DATA'
     def write_data(spark):
         spark.range(34).selectExpr("concat('test_', id % 9) as test_id",
             "concat('site_', id % 2) as site_id").repartition(200).write.parquet(data_path + "/tests")
