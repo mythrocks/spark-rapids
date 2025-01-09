@@ -162,10 +162,10 @@ fi
 
 if [[ "$WITH_BLOOP" == "1" ]]; then
     MVN_OPT="-DbloopInstall $MVN_OPT"
-    MVN_PHASES="clean install"
+    MVN_PHASES="install"
     export JAVA_HOME="/usr/lib/jvm/zulu11"
 else
-    MVN_PHASES="clean package"
+    MVN_PHASES="package"
 fi
 
 # Build the RAPIDS plugin by running package command for databricks
