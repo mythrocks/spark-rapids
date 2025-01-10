@@ -58,8 +58,21 @@ case class GpuRaiseError(left: Expression, right: Expression) extends GpuBinaryE
   override def doColumnar(lhs: GpuColumnVector, rhs: GpuScalar): ColumnVector =
     throw new UnsupportedOperationException("CALEB: Fail Vector/Scalar")
 
-  override def doColumnar(lhs: GpuScalar, rhs: GpuColumnVector): ColumnVector =
-    throw new UnsupportedOperationException("CALEB: Fail Scalar/Vector")
+  override def doColumnar(lhs: GpuScalar, rhs: GpuColumnVector): ColumnVector = {
+//    throw new UnsupportedOperationException("CALEB: Fail Scalar/Vector")
+    if (rhs.getRowCount <= 0) {
+      // For the case: when(condition, raise_error(col("a"))
+      return GpuColumnVector.columnVectorFromNull(0, NullType)
+    }
+    // Take the first one as the error message
+    withResource(rhs.getBase.getScalarElement(0)) { scalarMsg =>
+      if (!scalarMsg.isValid()) {
+        throw new RuntimeException()
+      } else {
+        throw new RuntimeException(scalarMsg.getJavaString())
+      }
+    }
+  }
 
   override def doColumnar(numRows: Int, lhs: GpuScalar, rhs: GpuScalar): ColumnVector =
       throw new UnsupportedOperationException("CALEB: Fail Scalar/Scalar")
