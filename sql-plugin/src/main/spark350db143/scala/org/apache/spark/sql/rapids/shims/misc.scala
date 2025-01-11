@@ -23,7 +23,10 @@ import com.nvidia.spark.rapids.{GpuColumnVector, GpuBinaryExpression, GpuScalar}
 import com.nvidia.spark.rapids.Arm.withResource
 
 import org.apache.spark.sql.catalyst.expressions.{ExpectsInputTypes, Expression}
+import org.apache.spark.sql.catalyst.util.MapData
+import org.apache.spark.sql.errors.QueryExecutionErrors.raiseError
 import org.apache.spark.sql.types.{AbstractDataType, DataType, NullType, StringType}
+import org.apache.spark.unsafe.types.UTF8String
 
 case class GpuRaiseError(left: Expression, right: Expression) extends GpuBinaryExpression with ExpectsInputTypes {
 
@@ -59,6 +62,32 @@ case class GpuRaiseError(left: Expression, right: Expression) extends GpuBinaryE
     throw new UnsupportedOperationException("CALEB: Fail Vector/Scalar")
 
   override def doColumnar(lhs: GpuScalar, rhs: GpuColumnVector): ColumnVector = {
+
+    ai.rapids.cudf.TableDebug.get().debug("CALEB: rhs: ", rhs.getBase)
+
+    println("CALEB: Extracting the first row: ")
+
+    val keyValueStructScalar = withResource(rhs.getBase.getScalarElement(0)) { rhsListScalar =>
+      withResource(rhsListScalar.getListAsColumnView) { rhsListAsColumn =>
+        rhsListAsColumn.getScalarElement(0)
+      }
+    }
+
+    withResource(keyValueStructScalar) { _ =>
+      withResource(keyValueStructScalar.getChildrenFromStructScalar) { childCols =>
+        withResource(childCols(0).getScalarElement(0)) { keyScalar =>
+          withResource(childCols(1).getScalarElement(0)) { valueScalar =>
+            println(s"CALEB: keyScalar: ${keyScalar.isValid}")
+            println(s"CALEB: valueScalar: ${valueScalar.isValid}")
+          }
+        }
+      }
+    }
+//    val rhsFront: Int = null.asInstanceOf[Int]
+//    println(s"CALEB: ${if (rhsFront == null) 0 else 1 }")
+//    val hostRhs = rhs.copyToHost()
+//    val rhsFront = hostRhs.getBase
+
 //    throw new UnsupportedOperationException("CALEB: Fail Scalar/Vector")
     if (rhs.getRowCount <= 0) {
       // For the case: when(condition, raise_error(col("a"))
@@ -74,6 +103,9 @@ case class GpuRaiseError(left: Expression, right: Expression) extends GpuBinaryE
     }
   }
 
-  override def doColumnar(numRows: Int, lhs: GpuScalar, rhs: GpuScalar): ColumnVector =
-      throw new UnsupportedOperationException("CALEB: Fail Scalar/Scalar")
+  override def doColumnar(numRows: Int, lhs: GpuScalar, rhs: GpuScalar): ColumnVector = {
+      val errorClass = lhs.getValue.asInstanceOf[UTF8String]
+      val errorParams = rhs.getValue.asInstanceOf[MapData]
+      throw raiseError(errorClass, errorParams)
+  }
 }

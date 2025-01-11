@@ -169,6 +169,7 @@ else
 fi
 
 # Build the RAPIDS plugin by running package command for databricks
+echo CALEB: $MVN_CMD -B -Ddatabricks -Dbuildver=$BUILDVER $MVN_PHASES -DskipTests $MVN_OPT
 $MVN_CMD -B -Ddatabricks -Dbuildver=$BUILDVER $MVN_PHASES -DskipTests $MVN_OPT
 
 if [[ "$WITH_DEFAULT_UPSTREAM_SHIM" != "0" ]]; then
