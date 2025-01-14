@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.
+ * Copyright (c) 2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,12 +18,12 @@
 spark-rapids-shim-json-lines ***/
 package org.apache.spark.sql.rapids.shims
 
-import ai.rapids.cudf.ColumnVector
-import com.nvidia.spark.rapids.{GpuColumnVector, GpuBinaryExpression, GpuScalar}
+import ai.rapids.cudf.{ColumnVector, ColumnView, DType, Scalar}
+import com.nvidia.spark.rapids.{GpuColumnVector, GpuBinaryExpression, GpuMapUtils, GpuScalar}
 import com.nvidia.spark.rapids.Arm.withResource
 
 import org.apache.spark.sql.catalyst.expressions.{ExpectsInputTypes, Expression}
-import org.apache.spark.sql.catalyst.util.MapData
+import org.apache.spark.sql.catalyst.util.{ArrayBasedMapData, MapData}
 import org.apache.spark.sql.errors.QueryExecutionErrors.raiseError
 import org.apache.spark.sql.types.{AbstractDataType, DataType, NullType, StringType}
 import org.apache.spark.unsafe.types.UTF8String
@@ -58,6 +58,49 @@ case class GpuRaiseError(left: Expression, right: Expression) extends GpuBinaryE
     }
   }
 
+  private def extractScalaUTF8String(stringScalar: Scalar): UTF8String = {
+    if (stringScalar.getType != DType.STRING) {
+      throw new UnsupportedOperationException("Unexpected scalar type, Expected String Scalar")
+    }
+
+    GpuScalar.extract(stringScalar).asInstanceOf[UTF8String]
+  }
+
+  private def extractStrings(stringsColumn: ColumnView): Array[UTF8String] = {
+    val size = stringsColumn.getRowCount.asInstanceOf[Int] // Already checked if exceeds threshold.
+    val output: Array[UTF8String] = new Array[UTF8String](size)
+    for (i <- 0 until size) {
+      output(i) = withResource(stringsColumn.getScalarElement(i)) {
+        extractScalaUTF8String(_)
+      }
+    }
+    output
+  }
+
+  private def makeMapData(listOfStructs: ColumnView): MapData = {
+    val THRESHOLD: Int = 10 // We don't expect more than these many, for raise_error.
+    val mapSize = listOfStructs.getRowCount
+
+    if (mapSize > THRESHOLD)
+      throw new UnsupportedOperationException("Unexpectedly large parameter map")
+
+    val outputKeys: Array[UTF8String] =
+      withResource(GpuMapUtils.getKeysAsListView(listOfStructs)) { listOfKeys =>
+        withResource(listOfKeys.getChildColumnView(0)) {
+          extractStrings(_)
+        }
+      }
+
+    val outputVals: Array[UTF8String] =
+      withResource(GpuMapUtils.getValuesAsListView(listOfStructs)) { listOfVals =>
+        withResource(listOfVals.getChildColumnView(0)) {
+          extractStrings(_)
+        }
+      }
+
+    ArrayBasedMapData(outputKeys, outputVals)
+  }
+
   override def doColumnar(lhs: GpuColumnVector, rhs: GpuScalar): ColumnVector =
     throw new UnsupportedOperationException("CALEB: Fail Vector/Scalar")
 
@@ -67,40 +110,15 @@ case class GpuRaiseError(left: Expression, right: Expression) extends GpuBinaryE
 
     println("CALEB: Extracting the first row: ")
 
-    val keyValueStructScalar = withResource(rhs.getBase.getScalarElement(0)) { rhsListScalar =>
-      withResource(rhsListScalar.getListAsColumnView) { rhsListAsColumn =>
-        rhsListAsColumn.getScalarElement(0)
-      }
+    val lhsErrorClass = lhs.getValue.asInstanceOf[UTF8String]
+
+    // TODO: Assert that rhs is not empty.
+    val rhsMapData = withResource(rhs.getBase.slice(0,1)) { slices =>
+      val firstRhsRow = slices(0)
+      makeMapData(firstRhsRow)
     }
 
-    withResource(keyValueStructScalar) { _ =>
-      withResource(keyValueStructScalar.getChildrenFromStructScalar) { childCols =>
-        withResource(childCols(0).getScalarElement(0)) { keyScalar =>
-          withResource(childCols(1).getScalarElement(0)) { valueScalar =>
-            println(s"CALEB: keyScalar: ${keyScalar.isValid}")
-            println(s"CALEB: valueScalar: ${valueScalar.isValid}")
-          }
-        }
-      }
-    }
-//    val rhsFront: Int = null.asInstanceOf[Int]
-//    println(s"CALEB: ${if (rhsFront == null) 0 else 1 }")
-//    val hostRhs = rhs.copyToHost()
-//    val rhsFront = hostRhs.getBase
-
-//    throw new UnsupportedOperationException("CALEB: Fail Scalar/Vector")
-    if (rhs.getRowCount <= 0) {
-      // For the case: when(condition, raise_error(col("a"))
-      return GpuColumnVector.columnVectorFromNull(0, NullType)
-    }
-    // Take the first one as the error message
-    withResource(rhs.getBase.getScalarElement(0)) { scalarMsg =>
-      if (!scalarMsg.isValid()) {
-        throw new RuntimeException()
-      } else {
-        throw new RuntimeException(scalarMsg.getJavaString())
-      }
-    }
+    throw raiseError(lhsErrorClass, rhsMapData)
   }
 
   override def doColumnar(numRows: Int, lhs: GpuScalar, rhs: GpuScalar): ColumnVector = {
