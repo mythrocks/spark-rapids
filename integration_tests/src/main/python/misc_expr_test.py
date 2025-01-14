@@ -34,8 +34,9 @@ def test_part_id():
                 f.spark_partition_id()))
 
 
-@pytest.mark.skipif(condition=is_spark_400_or_later() or is_databricks_version_or_later(14, 3),
-                    reason="raise_error() semantics have changed in Spark 4.0 and Databricks 14.3. ")
+is_new_raise_error_semantics=is_spark_400_or_later() or is_databricks_version_or_later(14, 3)
+
+
 def test_raise_error():
     data_gen = ShortGen(nullable=False, min_val=0, max_val=20, special_cases=[])
     assert_gpu_and_cpu_are_equal_collect(
@@ -45,38 +46,43 @@ def test_raise_error():
     assert_gpu_and_cpu_are_equal_collect(
         lambda spark: spark.range(0).select(f.raise_error(f.col("id"))))
 
+    error_fragment = "org.apache.spark.SparkRuntimeException" if is_new_raise_error_semantics \
+      else "java.lang.RuntimeException"
+
     assert_gpu_and_cpu_error(
         lambda spark: unary_op_df(spark, null_gen, length=2, num_slices=1).select(
                 f.raise_error(f.col('a'))).collect(),
         conf={},
-        error_message="java.lang.RuntimeException")
+        error_message=error_fragment)
 
+    error_fragment = error_fragment + (": [USER_RAISED_EXCEPTION] unexpected" if is_new_raise_error_semantics
+      else ": unexpected")
     assert_gpu_and_cpu_error(
         lambda spark: unary_op_df(spark, short_gen, length=2, num_slices=1).select(
                 f.raise_error(f.lit("unexpected"))).collect(),
         conf={},
-        error_message="java.lang.RuntimeException: unexpected")
+        error_message=error_fragment)
 
 
-@pytest.mark.skipif(condition=not(is_spark_400_or_later() or is_databricks_version_or_later(14, 3)),
-                    reason="raise_error() semantics have changed in Spark 4.0 and Databricks 14.3. ")
-def test_raise_error_new_semantics():
-    data_gen = ShortGen(nullable=False, min_val=0, max_val=20, special_cases=[])
-    assert_gpu_and_cpu_are_equal_collect(
-        lambda spark: unary_op_df(spark, data_gen, num_slices=2).select(
-            f.when(f.col('a') > 30, f.raise_error("unexpected"))))
-
-    assert_gpu_and_cpu_are_equal_collect(
-        lambda spark: spark.range(0).select(f.raise_error(f.col("id"))))
-
-    assert_gpu_and_cpu_error(
-        lambda spark: unary_op_df(spark, null_gen, length=2, num_slices=1).select(
-            f.raise_error(f.col('a'))).collect(),
-        conf={},
-        error_message="RuntimeException")
-
-    assert_gpu_and_cpu_error(
-        lambda spark: unary_op_df(spark, short_gen, length=2, num_slices=1).select(
-            f.raise_error(f.lit("unexpected"))).collect(),
-        conf={},
-        error_message="RuntimeException")
+# @pytest.mark.skipif(condition=not(is_spark_400_or_later() or is_databricks_version_or_later(14, 3)),
+#                     reason="raise_error() semantics have changed in Spark 4.0 and Databricks 14.3. ")
+# def test_raise_error_new_semantics():
+#     data_gen = ShortGen(nullable=False, min_val=0, max_val=20, special_cases=[])
+#     assert_gpu_and_cpu_are_equal_collect(
+#         lambda spark: unary_op_df(spark, data_gen, num_slices=2).select(
+#             f.when(f.col('a') > 30, f.raise_error("unexpected"))))
+#
+#     assert_gpu_and_cpu_are_equal_collect(
+#         lambda spark: spark.range(0).select(f.raise_error(f.col("id"))))
+#
+#     assert_gpu_and_cpu_error(
+#         lambda spark: unary_op_df(spark, null_gen, length=2, num_slices=1).select(
+#             f.raise_error(f.col('a'))).collect(),
+#         conf={},
+#         error_message="RuntimeException")
+#
+#     assert_gpu_and_cpu_error(
+#         lambda spark: unary_op_df(spark, short_gen, length=2, num_slices=1).select(
+#             f.raise_error(f.lit("unexpected"))).collect(),
+#         conf={},
+#         error_message="RuntimeException")

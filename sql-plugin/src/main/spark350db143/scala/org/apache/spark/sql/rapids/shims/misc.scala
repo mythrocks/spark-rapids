@@ -106,9 +106,11 @@ case class GpuRaiseError(left: Expression, right: Expression) extends GpuBinaryE
 
   override def doColumnar(lhs: GpuScalar, rhs: GpuColumnVector): ColumnVector = {
 
-    ai.rapids.cudf.TableDebug.get().debug("CALEB: rhs: ", rhs.getBase)
-
-    println("CALEB: Extracting the first row: ")
+    if (rhs.getRowCount <= 0) {
+      // For the case: when(condition, raise_error(col("a"))
+      // When `condition` selects no rows, a vector of nulls should be returned, instead of throwing.
+      return GpuColumnVector.columnVectorFromNull(0, NullType)
+    }
 
     val lhsErrorClass = lhs.getValue.asInstanceOf[UTF8String]
 
@@ -122,6 +124,12 @@ case class GpuRaiseError(left: Expression, right: Expression) extends GpuBinaryE
   }
 
   override def doColumnar(numRows: Int, lhs: GpuScalar, rhs: GpuScalar): ColumnVector = {
+      if (numRows <= 0) {
+        // For the case: when(condition, raise_error(col("a"))
+        // When `condition` selects no rows, a vector of nulls should be returned, instead of throwing.
+        return GpuColumnVector.columnVectorFromNull(0, NullType)
+      }
+
       val errorClass = lhs.getValue.asInstanceOf[UTF8String]
       val errorParams = rhs.getValue.asInstanceOf[MapData]
       throw raiseError(errorClass, errorParams)
