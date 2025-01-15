@@ -22,7 +22,7 @@ package com.nvidia.spark.rapids.shims
 import com.nvidia.spark.rapids.{ExprRule, GpuOverrides}
 import com.nvidia.spark.rapids.{ExprChecks, GpuExpression, TypeSig, BinaryExprMeta}
 
-import org.apache.spark.sql.catalyst.expressions.{Expression, RaiseError}
+import org.apache.spark.sql.catalyst.expressions.{Expression, Literal, RaiseError}
 import org.apache.spark.sql.rapids.shims.GpuRaiseError
 
 object RaiseErrorShim {
@@ -31,10 +31,20 @@ object RaiseErrorShim {
       "Throw an exception",
       ExprChecks.binaryProject(
         TypeSig.NULL, TypeSig.NULL,
-        ("errorClassName", TypeSig.STRING, TypeSig.STRING),
-        ("errorParams", TypeSig.all, TypeSig.all),
-        ),
+        ("errorClass", TypeSig.STRING, TypeSig.STRING),
+        ("errorParams", TypeSig.MAP.nested(TypeSig.STRING), TypeSig.MAP.nested(TypeSig.STRING)),
+      ),
       (a, conf, p, r) => new BinaryExprMeta[RaiseError](a, conf, p, r) {
+
+        override def tagExprForGpu(): Unit = {
+          // In Databricks 14.3 and Spark 4.0, RaiseError forwards the lhs expression (i.e. the error-class)
+          // as a scalar value.  A vector/column here would be surprising.
+          a.errorClass match {
+            case _: Literal => // Supported.
+            case _ => willNotWorkOnGpu(s"expected error-class to be a STRING literal")
+          }
+        }
+
         override def convertToGpu(lhsErrorClass: Expression, rhsErrorParams: Expression): GpuExpression =
           GpuRaiseError(lhsErrorClass, rhsErrorParams)
       })).map(r => (r.getClassFor.asSubclass(classOf[Expression]), r)).toMap

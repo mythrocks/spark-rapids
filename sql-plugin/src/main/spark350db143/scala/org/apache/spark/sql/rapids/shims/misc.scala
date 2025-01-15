@@ -15,10 +15,11 @@
  */
 /*** spark-rapids-shim-json-lines
 {"spark": "350db143"}
+{"spark": "400"}
 spark-rapids-shim-json-lines ***/
 package org.apache.spark.sql.rapids.shims
 
-import ai.rapids.cudf.{ColumnVector, ColumnView, DType, Scalar}
+import ai.rapids.cudf.{ColumnVector, ColumnView, Scalar}
 import com.nvidia.spark.rapids.{GpuColumnVector, GpuBinaryExpression, GpuMapUtils, GpuScalar}
 import com.nvidia.spark.rapids.Arm.withResource
 
@@ -28,6 +29,12 @@ import org.apache.spark.sql.errors.QueryExecutionErrors.raiseError
 import org.apache.spark.sql.types.{AbstractDataType, DataType, NullType, StringType}
 import org.apache.spark.unsafe.types.UTF8String
 
+/**
+ * Implements `raise_error()` for Databricks 14.3 and Spark 4.0.
+ * Note that while the arity `raise_error()` remains 1 for all user-facing APIs (SQL, Scala, Python).
+ * But internally, the implementation uses a binary expression, where the first argument indicates
+ * the "error-class" for the error being raised.
+ */
 case class GpuRaiseError(left: Expression, right: Expression) extends GpuBinaryExpression with ExpectsInputTypes {
 
   val errorClass: Expression = left
@@ -40,29 +47,14 @@ case class GpuRaiseError(left: Expression, right: Expression) extends GpuBinaryE
   /** Could evaluating this expression cause side-effects, such as throwing an exception? */
   override def hasSideEffects: Boolean = true
 
-  override def doColumnar(lhs: GpuColumnVector, rhs: GpuColumnVector): ColumnVector = {
-    val input = rhs
+  override def doColumnar(lhs: GpuColumnVector, rhs: GpuColumnVector): ColumnVector =
+    throw new UnsupportedOperationException("Expected errorClass (lhs) to be a String literal")
 
-    if (input.getRowCount <= 0) {
-      // For the case: when(condition, raise_error(col("a"))
-      return GpuColumnVector.columnVectorFromNull(0, NullType)
-    }
-
-    // Take the first one as the error message
-    withResource(input.getBase.getScalarElement(0)) { scalarMsg =>
-      if (!scalarMsg.isValid()) {
-        throw new RuntimeException()
-      } else {
-        throw new RuntimeException(scalarMsg.getJavaString())
-      }
-    }
-  }
+  override def doColumnar(lhs: GpuColumnVector, rhs: GpuScalar): ColumnVector =
+    throw new UnsupportedOperationException("Expected errorClass (lhs) to be a String literal")
 
   private def extractScalaUTF8String(stringScalar: Scalar): UTF8String = {
-    if (stringScalar.getType != DType.STRING) {
-      throw new UnsupportedOperationException("Unexpected scalar type, Expected String Scalar")
-    }
-
+    // This is guaranteed to be a string scalar.
     GpuScalar.extract(stringScalar).asInstanceOf[UTF8String]
   }
 
@@ -78,22 +70,22 @@ case class GpuRaiseError(left: Expression, right: Expression) extends GpuBinaryE
   }
 
   private def makeMapData(listOfStructs: ColumnView): MapData = {
-    val THRESHOLD: Int = 10 // We don't expect more than these many, for raise_error.
+    val THRESHOLD: Int = 10 // Avoiding surprises with large maps.  All testing indicates a map with 1 entry.
     val mapSize = listOfStructs.getRowCount
 
     if (mapSize > THRESHOLD)
-      throw new UnsupportedOperationException("Unexpectedly large parameter map")
+      throw new UnsupportedOperationException("Unexpectedly large error-parameter map")
 
     val outputKeys: Array[UTF8String] =
       withResource(GpuMapUtils.getKeysAsListView(listOfStructs)) { listOfKeys =>
-        withResource(listOfKeys.getChildColumnView(0)) {
+        withResource(listOfKeys.getChildColumnView(0)) { // Strings child of LIST column.
           extractStrings(_)
         }
       }
 
     val outputVals: Array[UTF8String] =
       withResource(GpuMapUtils.getValuesAsListView(listOfStructs)) { listOfVals =>
-        withResource(listOfVals.getChildColumnView(0)) {
+        withResource(listOfVals.getChildColumnView(0)) { // Strings child of LIST column.
           extractStrings(_)
         }
       }
@@ -101,11 +93,7 @@ case class GpuRaiseError(left: Expression, right: Expression) extends GpuBinaryE
     ArrayBasedMapData(outputKeys, outputVals)
   }
 
-  override def doColumnar(lhs: GpuColumnVector, rhs: GpuScalar): ColumnVector =
-    throw new UnsupportedOperationException("CALEB: Fail Vector/Scalar")
-
   override def doColumnar(lhs: GpuScalar, rhs: GpuColumnVector): ColumnVector = {
-
     if (rhs.getRowCount <= 0) {
       // For the case: when(condition, raise_error(col("a"))
       // When `condition` selects no rows, a vector of nulls should be returned, instead of throwing.
@@ -114,7 +102,6 @@ case class GpuRaiseError(left: Expression, right: Expression) extends GpuBinaryE
 
     val lhsErrorClass = lhs.getValue.asInstanceOf[UTF8String]
 
-    // TODO: Assert that rhs is not empty.
     val rhsMapData = withResource(rhs.getBase.slice(0,1)) { slices =>
       val firstRhsRow = slices(0)
       makeMapData(firstRhsRow)
