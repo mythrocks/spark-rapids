@@ -38,7 +38,7 @@ legacy_semantics_key = "spark.sql.legacy.raiseErrorWithoutErrorClass"
 is_new_raise_error_semantics_version=is_spark_400_or_later() or is_databricks_version_or_later(14, 3)
 
 def raise_error_test_impl(test_conf):
-    use_new_error_semantics = test_conf.get(legacy_semantics_key) and test_conf[legacy_semantics_key].lower == 'false'
+    use_new_error_semantics = legacy_semantics_key in test_conf and test_conf[legacy_semantics_key] == False
 
     data_gen = ShortGen(nullable=False, min_val=0, max_val=20, special_cases=[])
     assert_gpu_and_cpu_are_equal_collect(
@@ -66,14 +66,25 @@ def raise_error_test_impl(test_conf):
         conf=test_conf,
         error_message=error_fragment)
 
+
 def test_raise_error_legacy_semantics():
+    """
+    Tests the "legacy" semantics of raise_error(), i.e. where the error
+    does not include an error class.
+    """
     if is_new_raise_error_semantics_version:
-        raise_error_test_impl(test_conf={legacy_semantics_key: 'true'})
+        raise_error_test_impl(test_conf={legacy_semantics_key: True})
     else:
         raise_error_test_impl(test_conf={})
+
 
 @pytest.mark.skipif(condition=not is_new_raise_error_semantics_version,
                     reason="New raise_error semantics (with error-class) is only available "
                            "on Spark 4.0 and Databricks 14.3.")
 def test_raise_error_new_semantics():
-    raise_error_test_impl(test_conf={legacy_semantics_key: 'false'})
+    """
+    Tests the "legacy" semantics of raise_error(), i.e. where the error
+    includes an error class.  Unsupported in Spark versions predating
+    Spark 4.0, Databricks 14.3.
+    """
+    raise_error_test_impl(test_conf={legacy_semantics_key: False})
