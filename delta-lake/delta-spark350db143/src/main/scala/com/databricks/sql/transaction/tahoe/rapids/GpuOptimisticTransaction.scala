@@ -111,10 +111,15 @@ class GpuOptimisticTransaction(
       val _spark = spark
       val protocol = deltaLog.unsafeVolatileSnapshot.protocol
 
+      def isDeletionVectorsSupported = {
+        protocol.isFeatureSupported(DeletionVectorsTableFeature) ||
+          !spark.sessionState.conf.contains(
+            "spark.databricks.delta.properties.defaults.enableDeletionVectors")
+      }
+
       val statsCollection = new GpuStatisticsCollection {
         override val spark = _spark
-        override val deletionVectorsSupported =
-          protocol.isFeatureSupported(DeletionVectorsTableFeature)
+        override val deletionVectorsSupported = isDeletionVectorsSupported
         override val tableDataSchema = tableSchema
         override val dataSchema = statsDataSchema.toStructType
         override val numIndexedCols = indexedCols
