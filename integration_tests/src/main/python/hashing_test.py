@@ -175,3 +175,14 @@ def test_str_special_characters_sha1():
     special_string_gen = StringGen().with_special_case('好').with_special_case('吃')
     assert_gpu_and_cpu_are_equal_collect(
         lambda spark: unary_op_df(spark, special_string_gen).selectExpr('sha1(a)'))
+
+
+@pytest.mark.parametrize("datagen", [binary_gen,
+                                     string_gen,
+                                     StringGen().with_special_case('好').with_special_case('吃')])
+@pytest.mark.parametrize("bitlength", [224], ids=idfn)
+def test_str_sha2(bitlength, datagen):
+    assert_gpu_and_cpu_are_equal_collect(
+        lambda spark: unary_op_df(spark, datagen).selectExpr(f'sha2(a, {bitlength})'))
+    assert_gpu_and_cpu_are_equal_collect(
+        lambda spark: unary_op_df(spark, datagen).selectExpr(f'sha2("asdf", {bitlength})'))
