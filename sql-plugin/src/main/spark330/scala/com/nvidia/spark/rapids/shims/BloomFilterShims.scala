@@ -82,7 +82,7 @@ object BloomFilterShims {
               childExprs.head.convertToGpu(),
               a.estimatedNumItemsExpression.eval().asInstanceOf[Number].longValue,
               a.numBitsExpression.eval().asInstanceOf[Number].longValue,
-              BloomFilter.VERSION_2,
+              BloomFilterConstantsShims.BLOOM_FILTER_FORMAT_VERSION,
               BloomFilter.DEFAULT_SEED)
           }
         })
