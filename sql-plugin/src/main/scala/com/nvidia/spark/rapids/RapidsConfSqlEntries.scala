@@ -258,6 +258,12 @@ private[rapids] trait RapidsConfSqlEntries extends RapidsConfResourceEntries {
       .booleanConf
       .createWithDefault(false)
 
+  val ENABLE_LTO_ANSI_ADD = conf("spark.rapids.lto.ansi.add.enabled")
+      .doc("Enable the experimental LTO backend for supported ANSI GpuAdd expressions.")
+      .internal()
+      .booleanConf
+      .createWithDefault(false)
+
   val ENABLE_TIERED_PROJECT = conf("spark.rapids.sql.tiered.project.enabled")
       .doc("Enable tiered projections.")
       .internal()

@@ -65,7 +65,7 @@ case class AddRuleMeta(
   }
 
   override def convertToGpu(lhs: Expression, rhs: Expression): GpuExpression =
-    GpuAdd(lhs, rhs, ansiEnabled)(a.origin)
+    GpuAdd(lhs, rhs, ansiEnabled, conf.isLtoAnsiAddEnabled)(a.origin)
 }
 
 case class SubtractRuleMeta(
