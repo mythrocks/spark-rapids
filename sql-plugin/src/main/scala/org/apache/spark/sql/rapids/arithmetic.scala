@@ -307,6 +307,8 @@ case class GpuAbs(child: Expression, failOnError: Boolean) extends CudfUnaryExpr
 }
 
 abstract class GpuAddBase extends CudfBinaryArithmetic with Serializable {
+  def useLtoAnsiAdd: Boolean = false
+
   override def inputType: AbstractDataType = TypeCollection.NumericAndInterval
 
   override def symbol: String = "+"
@@ -319,6 +321,46 @@ abstract class GpuAddBase extends CudfBinaryArithmetic with Serializable {
 
   override def hasSideEffects: Boolean =
     (failOnError && GpuAnsi.needBasicOpOverflowCheck(dataType)) || super.hasSideEffects
+
+  private[this] def useLtoAnsiAddPath: Boolean =
+    useLtoAnsiAdd && failOnError && GpuAnsi.needBasicOpOverflowCheck(dataType)
+
+  private[this] def isArithmeticOverflow(e: CudfException): Boolean =
+    Option(e.getMessage).exists(_.contains("ARITHMETIC_OVERFLOW"))
+
+  private[this] def doLtoAnsiAdd(add: => ColumnVector): ColumnVector = {
+    try {
+      add
+    } catch {
+      case e: CudfException if isArithmeticOverflow(e) =>
+        throw RapidsErrorUtils.arithmeticOverflowError(
+          "One or more rows overflow for Add operation.", origin)
+    }
+  }
+
+  override def doColumnar(lhs: GpuColumnVector, rhs: GpuColumnVector): ColumnVector = {
+    if (useLtoAnsiAddPath) {
+      doLtoAnsiAdd(Arithmetic.add(lhs.getBase, rhs.getBase, /* ansi */ true, /* try_mode */ false))
+    } else {
+      doColumnar(lhs.getBase, rhs.getBase)
+    }
+  }
+
+  override def doColumnar(lhs: GpuScalar, rhs: GpuColumnVector): ColumnVector = {
+    if (useLtoAnsiAddPath) {
+      doLtoAnsiAdd(Arithmetic.add(lhs.getBase, rhs.getBase, /* ansi */ true, /* try_mode */ false))
+    } else {
+      doColumnar(lhs.getBase, rhs.getBase)
+    }
+  }
+
+  override def doColumnar(lhs: GpuColumnVector, rhs: GpuScalar): ColumnVector = {
+    if (useLtoAnsiAddPath) {
+      doLtoAnsiAdd(Arithmetic.add(lhs.getBase, rhs.getBase, /* ansi */ true, /* try_mode */ false))
+    } else {
+      doColumnar(lhs.getBase, rhs.getBase)
+    }
+  }
 
   override def doColumnar(lhs: BinaryOperable, rhs: BinaryOperable): ColumnVector = {
     val ret = super.doColumnar(lhs, rhs)

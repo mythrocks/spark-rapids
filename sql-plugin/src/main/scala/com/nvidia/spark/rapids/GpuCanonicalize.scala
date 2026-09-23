@@ -83,9 +83,9 @@ object GpuCanonicalize {
 
   /** Rearrange expressions that are commutative or associative. */
   private def expressionReorder(e: Expression): Expression = e match {
-    case a @ GpuAdd(_, _, f) =>
-      orderCommutative(a, { case GpuAdd(l, r, _) => Seq(l, r) })
-        .reduce((l, r) => GpuAdd(l, r, f)(a.origin))
+    case a @ GpuAdd(_, _, f, useLtoAnsiAdd) =>
+      orderCommutative(a, { case GpuAdd(l, r, _, _) => Seq(l, r) })
+        .reduce((l, r) => GpuAdd(l, r, f, useLtoAnsiAdd)(a.origin))
     case m @ GpuMultiply(_, _, f) =>
       orderCommutative(m, { case GpuMultiply(l, r, _) => Seq(l, r) })
         .reduce((l, r) => GpuMultiply(l, r, f)(m.origin))

@@ -218,7 +218,8 @@ trait GpuAddSub extends CudfBinaryArithmetic {
 case class GpuAdd(
     left: Expression,
     right: Expression,
-    failOnError: Boolean)(
+    failOnError: Boolean,
+    override val useLtoAnsiAdd: Boolean = RapidsConf.ENABLE_LTO_ANSI_ADD.get(SQLConf.get))(
     override val origin: Origin = CurrentOrigin.get)
     extends GpuAddBase with GpuAddSub {
   override def otherCopyArgs: Seq[AnyRef] = origin :: Nil
