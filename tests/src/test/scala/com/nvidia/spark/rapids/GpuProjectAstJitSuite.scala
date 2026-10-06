@@ -17,7 +17,8 @@
 package com.nvidia.spark.rapids
 
 import ai.rapids.cudf.{ColumnVector, DType, Table}
-import ai.rapids.cudf.ast.{AstExpression, AstJitProgram, CompiledExpression}
+import ai.rapids.cudf.ast.{AstExpression, AstJitProgram, BinaryOperation, CompiledExpression,
+  JitOperation}
 import com.nvidia.spark.rapids.GpuMetric._
 import com.nvidia.spark.rapids.ProjectAstTestUtils.collectExpressions
 import org.mockito.Mockito.{doThrow, mock, times, verify, when}
@@ -29,7 +30,7 @@ import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference,
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.rapids.{GpuAdd, GpuGreatest, GpuMultiply, GpuSubtract}
 import org.apache.spark.sql.rapids.metrics.source.MockTaskContext
-import org.apache.spark.sql.types.{FloatType, IntegerType, LongType}
+import org.apache.spark.sql.types.{ByteType, FloatType, IntegerType, LongType, ShortType}
 import org.apache.spark.util.TaskCompletionListener
 
 class GpuProjectAstJitSuite extends AnyFunSuite {
@@ -406,18 +407,53 @@ class GpuProjectAstJitSuite extends AnyFunSuite {
     assertResult(2)(collectExpressions[GpuAstJitExpression](project.exprTiers.head).size)
   }
 
-  test("project AST JIT excludes ANSI and floating point arithmetic") {
+  test("project AST JIT supports ANSI integer and long add") {
+    Seq(IntegerType, LongType).foreach { dataType =>
+      val left = reference(0, dataType)
+      val right = reference(1, dataType)
+      val expression = alias(GpuAdd(left, right, failOnError = true)(), "ansi_sum")
+
+      val wrapped = GpuAstJitExpression.wrapProjectExpressions(List(expression))
+      val jit = GpuAstJitExpression.extractTopLevel(wrapped.head)
+      assert(jit.isDefined, s"expected AST JIT for $dataType ANSI add")
+      assert(jit.get.child.isInstanceOf[GpuAdd])
+    }
+  }
+
+  test("project AST JIT uses checked JIT add for ANSI add") {
+    val left = GpuBoundReference(0, IntegerType, nullable = true)(
+      NamedExpression.newExprId, "c0")
+    val right = GpuBoundReference(1, IntegerType, nullable = true)(
+      NamedExpression.newExprId, "c1")
+
+    val ansiAddAst = GpuAdd(left, right, failOnError = true)().convertToAst(Int.MaxValue)
+    val regularAddAst = GpuAdd(left, right, failOnError = false)().convertToAst(Int.MaxValue)
+
+    assert(ansiAddAst.isInstanceOf[JitOperation])
+    assert(regularAddAst.isInstanceOf[BinaryOperation])
+  }
+
+  test("project AST JIT excludes unsupported ANSI add types and floating point arithmetic") {
     val intLeft = reference(0, IntegerType)
     val intRight = reference(1, IntegerType)
+    val byteLeft = reference(0, ByteType)
+    val byteRight = reference(1, ByteType)
+    val shortLeft = reference(0, ShortType)
+    val shortRight = reference(1, ShortType)
     val floatLeft = reference(0, FloatType)
     val floatRight = reference(1, FloatType)
 
     val ansiAdd = alias(GpuAdd(intLeft, intRight, failOnError = true)(), "ansi_sum")
+    val ansiByteAdd = alias(GpuAdd(byteLeft, byteRight, failOnError = true)(), "ansi_byte_sum")
+    val ansiShortAdd = alias(
+      GpuAdd(shortLeft, shortRight, failOnError = true)(), "ansi_short_sum")
     val floatMultiply = alias(
       GpuMultiply(floatLeft, floatRight, failOnError = false)(), "float_product")
 
-    val wrapped = GpuAstJitExpression.wrapProjectExpressions(List(ansiAdd, floatMultiply))
-    assert(wrapped.forall(_.find(_.isInstanceOf[GpuAstJitExpression]).isEmpty))
+    val wrapped = GpuAstJitExpression.wrapProjectExpressions(
+      List(ansiAdd, ansiByteAdd, ansiShortAdd, floatMultiply))
+    assert(GpuAstJitExpression.extractTopLevel(wrapped.head).isDefined)
+    assert(wrapped.tail.forall(GpuAstJitExpression.extractTopLevel(_).isEmpty))
   }
 
   test("project AST JIT does not compile a literal or pass-through") {

@@ -14,7 +14,8 @@
 
 import pytest
 
-from asserts import assert_cpu_and_gpu_are_equal_collect_with_capture, assert_gpu_and_cpu_are_equal_collect
+from asserts import assert_cpu_and_gpu_are_equal_collect_with_capture, assert_gpu_and_cpu_are_equal_collect, \
+    assert_gpu_and_cpu_error
 from data_gen import *
 from marks import approximate_float, datagen_overrides, ignore_order, disable_ansi_mode
 from spark_session import with_cpu_session, is_spark_359, is_spark_403_or_404, \
@@ -73,6 +74,8 @@ _project_ast_jit_and_legacy_enabled_conf = {
     "spark.rapids.sql.projectAstEnabled": "true",
     "spark.rapids.sql.projectAstJitEnabled": "true"
 }
+_project_ast_jit_ansi_enabled_conf = copy_and_update(
+    ansi_enabled_conf, _project_ast_jit_enabled_conf)
 
 
 def assert_gpu_ast(is_supported, func, conf={}):
@@ -402,6 +405,53 @@ def test_jit_add_multiply(data_gen):
         exist_classes=r"GpuProject.*AST_JIT",
         non_exist_classes="GpuProjectAst",
         conf=_project_ast_jit_enabled_conf)
+
+@pytest.mark.parametrize(
+    'schema,rows,literal',
+    [
+        ("a int, b int", [(1, 2), (2147483646, 1), (None, 5), (7, None)], "7"),
+        ("a long, b long", [(1, 2), (9223372036854775806, 1), (None, 5), (7, None)], "7L")
+    ],
+    ids=["Integer", "Long"])
+def test_project_ast_jit_ansi_add_no_overflow(schema, rows, literal):
+    assert_cpu_and_gpu_are_equal_collect_with_capture(
+        lambda spark: spark.createDataFrame(rows, schema).selectExpr(
+            "a + b AS sum",
+            f"{literal} + b AS literal_sum"),
+        exist_classes=r"GpuProject.*AST_JIT.*AS sum.*AST_JIT.*AS literal_sum",
+        non_exist_classes="GpuProjectAst",
+        conf=_project_ast_jit_ansi_enabled_conf)
+
+def test_project_ast_jit_ansi_add_nulls():
+    assert_cpu_and_gpu_are_equal_collect_with_capture(
+        lambda spark: spark.createDataFrame(
+            [(1, None), (None, 2), (2147483647, None)],
+            "a int, b int").selectExpr("a + b AS sum"),
+        exist_classes=r"GpuProject.*AST_JIT.*AS sum",
+        non_exist_classes="GpuProjectAst",
+        conf=_project_ast_jit_ansi_enabled_conf)
+
+def test_project_ast_jit_ansi_add_disabled():
+    assert_cpu_and_gpu_are_equal_collect_with_capture(
+        lambda spark: spark.createDataFrame(
+            [(1, 2), (2147483646, 1)],
+            "a int, b int").selectExpr("a + b AS sum"),
+        exist_classes="GpuProject",
+        non_exist_classes="AST_JIT|GpuProjectAstExpression",
+        conf=ansi_enabled_conf)
+
+@pytest.mark.parametrize(
+    'schema,rows,expr',
+    [
+        ("a int", [(2147483647,)], "a + 1 AS sum"),
+        ("a long", [(9223372036854775807,)], "a + 1L AS sum")
+    ],
+    ids=["int", "long"])
+def test_project_ast_jit_ansi_add_overflow(schema, rows, expr):
+    assert_gpu_and_cpu_error(
+        lambda spark: spark.createDataFrame(rows, schema).selectExpr(expr).collect(),
+        conf=_project_ast_jit_ansi_enabled_conf,
+        error_message="ARITHMETIC_OVERFLOW")
 
 @pytest.mark.parametrize('data_gen', [int_gen, long_gen], ids=idfn)
 @disable_ansi_mode

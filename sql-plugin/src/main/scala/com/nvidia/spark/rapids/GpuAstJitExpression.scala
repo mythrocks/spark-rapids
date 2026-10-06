@@ -18,7 +18,7 @@ package com.nvidia.spark.rapids
 
 import scala.collection.mutable
 
-import ai.rapids.cudf.{DType, Table}
+import ai.rapids.cudf.{CudfException, DType, Table}
 import ai.rapids.cudf.ast.{AstExpression, AstJitProgram, CompiledExpression}
 import com.nvidia.spark.Retryable
 import com.nvidia.spark.rapids.Arm.withResource
@@ -27,7 +27,9 @@ import com.nvidia.spark.rapids.RapidsPluginImplicits._
 
 import org.apache.spark.sql.catalyst.expressions.{Expression, NamedExpression}
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.rapids.GpuAddBase
 import org.apache.spark.sql.rapids.catalyst.expressions.GpuExpressionEquals
+import org.apache.spark.sql.rapids.shims.RapidsErrorUtils
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
 object GpuAstJitExpression {
@@ -56,6 +58,18 @@ object GpuAstJitExpression {
       new JitProgramGroup(roots, referencedOrdinals)
     }
   }
+
+  private def isCudfArithmeticOverflow(e: CudfException): Boolean = {
+    val message = Option(e.getMessage).getOrElse("")
+    message.contains("ARITHMETIC_OVERFLOW") &&
+      message.contains("Transform UDF evaluation failed")
+  }
+
+  private def hasAnsiAddOverflowOperation(expressions: Seq[GpuAstJitExpression]): Boolean =
+    expressions.exists(_.child.find {
+      case add: GpuAddBase => add.isProjectAstJitAnsiAdd
+      case _ => false
+    }.isDefined)
 
   private def inputSchema(
       group: JitProgramGroup,
@@ -265,8 +279,15 @@ object GpuAstJitExpression {
     val owner = expressions.head
     val program = owner.getJitProgram(expressions, table)
     owner.withComputeMetrics(table.getRowCount) {
-      withResource(program.computeTable(table)) { result =>
-        GpuColumnVector.from(result, expressions.map(_.dataType).toArray)
+      try {
+        withResource(program.computeTable(table)) { result =>
+          GpuColumnVector.from(result, expressions.map(_.dataType).toArray)
+        }
+      } catch {
+        case e: CudfException if hasAnsiAddOverflowOperation(expressions) &&
+            isCudfArithmeticOverflow(e) =>
+          throw RapidsErrorUtils.arithmeticOverflowError(
+            "One or more rows overflow for Add operation.")
       }
     }
   }

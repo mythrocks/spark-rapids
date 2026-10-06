@@ -314,11 +314,31 @@ abstract class GpuAddBase extends CudfBinaryArithmetic with Serializable {
   override def binaryOp: BinaryOp = BinaryOp.ADD
   override def astOperator: Option[BinaryOperator] = Some(ast.BinaryOperator.ADD)
 
+  private def isProjectAstJitAddSupportedType: Boolean =
+    dataType == IntegerType || dataType == LongType
+
+  def isProjectAstJitAnsiAdd: Boolean =
+    failOnError && isProjectAstJitAddSupportedType
+
   override protected def astJitCompatible: Boolean =
-    !failOnError && (dataType == IntegerType || dataType == LongType)
+    isProjectAstJitAddSupportedType
 
   override def hasSideEffects: Boolean =
     (failOnError && GpuAnsi.needBasicOpOverflowCheck(dataType)) || super.hasSideEffects
+
+  override def convertToAst(numFirstTableColumns: Int): ast.AstExpression = {
+    val leftAst = left.asInstanceOf[GpuExpression].convertToAst(numFirstTableColumns)
+    val rightAst = right.asInstanceOf[GpuExpression].convertToAst(numFirstTableColumns)
+    if (isProjectAstJitAnsiAdd) {
+      new ast.JitOperation(
+        ast.JitOperator.ADD_OVERFLOW,
+        ast.JitErrorPolicy.PROPAGATE,
+        leftAst,
+        rightAst)
+    } else {
+      new ast.BinaryOperation(ast.BinaryOperator.ADD, leftAst, rightAst)
+    }
+  }
 
   override def doColumnar(lhs: BinaryOperable, rhs: BinaryOperable): ColumnVector = {
     val ret = super.doColumnar(lhs, rhs)
