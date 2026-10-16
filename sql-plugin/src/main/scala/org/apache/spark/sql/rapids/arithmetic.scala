@@ -36,6 +36,9 @@ import org.apache.spark.sql.types._
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
 object AddOverflowChecks {
+  private[rapids] val overflowErrorMessage: String =
+    "One or more rows overflow for Add operation"
+
   def basicOpOverflowCheck(
       lhs: BinaryOperable,
       rhs: BinaryOperable,
@@ -66,8 +69,7 @@ object AddOverflowChecks {
         withResource(signDiff.any()) { any =>
           if (any.isValid && any.getBoolean) {
             throw RapidsErrorUtils.arithmeticOverflowError(
-              "One or more rows overflow for Add operation.",
-              origin)
+              overflowErrorMessage, origin)
           }
         }
       }
@@ -331,7 +333,7 @@ abstract class GpuAddBase extends CudfBinaryArithmetic with Serializable {
     } catch {
       case e: CudfException if isArithmeticOverflow(e) =>
         throw RapidsErrorUtils.arithmeticOverflowError(
-          "One or more rows overflow for Add operation.", origin)
+          AddOverflowChecks.overflowErrorMessage, origin)
     }
   }
 

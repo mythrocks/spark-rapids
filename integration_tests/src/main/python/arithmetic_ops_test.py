@@ -1296,6 +1296,20 @@ def test_add_overflow_with_ansi_enabled(data, tp, expr):
             conf=ansi_enabled_conf)
 
 
+_data_type_expr_for_integral_add_overflow = [
+    data_type_expr for data_type_expr in _data_type_expr_for_add_overflow
+    if isinstance(data_type_expr[1], IntegralType)]
+
+@pytest.mark.parametrize('data,tp,expr', _data_type_expr_for_integral_add_overflow, ids=idfn)
+def test_lto_add_overflow_with_ansi_enabled(data, tp, expr):
+    conf = copy_and_update(
+        ansi_enabled_conf, {'spark.rapids.lto.ansi.add.enabled': 'true'})
+    assert_gpu_and_cpu_error(
+        lambda spark: _get_overflow_df(spark, data, tp, expr).collect(),
+        conf=conf,
+        error_message=_arithmetic_exception_string)
+
+
 _data_type_expr_for_sub_overflow = [
     ([-128], ByteType(), 'a - 1Y'),
     ([-32768], ShortType(), 'a -1S'),
