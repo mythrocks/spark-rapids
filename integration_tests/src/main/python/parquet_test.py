@@ -947,6 +947,39 @@ def test_parquet_input_file_name_many_columns(spark_tmp_path, v1_enabled_list, r
                     .selectExpr('a', 'b', 'c', 'd', 'input_file_name()'),
             conf=all_confs)
 
+# Shuffles, partial aggregates and broadcast joins carry input_file_name() as a dictionary
+# column; the exchange decodes it before serialization.
+_input_file_name_queries = {
+    'hash_repartition': lambda df: df.repartition(4, 'a'),
+    'hash_repartition_on_file': lambda df: df.repartition(4, 'f'),
+    'round_robin': lambda df: df.repartition(3),
+    'distinct': lambda df: df.select('f').distinct(),
+    'group_by_file': lambda df: df.groupBy('f').count(),
+    'grouped_values': lambda df: df.groupBy('a').agg(f.count('f'), f.min('f'), f.max('f')),
+    'broadcast_join': lambda df: df.join(
+        f.broadcast(df.sparkSession.range(0, 100).selectExpr('CAST(id AS INT) AS a')), 'a'),
+}
+
+@ignore_order(local=True)
+@pytest.mark.parametrize('query', list(_input_file_name_queries), ids=idfn)
+@pytest.mark.parametrize('kudo_mode', ['off', 'CPU', 'GPU'], ids=idfn)
+def test_parquet_input_file_name_through_shuffle(spark_tmp_path, query, kudo_mode):
+    if kudo_mode == 'GPU' and query == 'round_robin':
+        # Fails without input_file_name() too: a round-robin repartition of a STRING column
+        # with GPU kudo writes trips SlicedSerializedColumnVector's `end > start` assertion.
+        pytest.skip('GPU kudo round-robin repartition fails independently of input_file_name()')
+    data_path = spark_tmp_path + '/PARQUET_DATA'
+    gens = [('a', IntegerGen(min_val=0, max_val=200, special_cases=[])), ('b', string_gen)]
+    with_cpu_session(
+            lambda spark : gen_df(spark, gens).repartition(3).write.parquet(data_path))
+    conf = {'spark.rapids.shuffle.kudo.serializer.enabled': str(kudo_mode != 'off').lower()}
+    if kudo_mode != 'off':
+        conf['spark.rapids.shuffle.kudo.serializer.write.mode'] = kudo_mode
+    assert_gpu_and_cpu_are_equal_collect(
+            lambda spark : _input_file_name_queries[query](
+                spark.read.parquet(data_path).select('a', 'b', f.input_file_name().alias('f'))),
+            conf=conf)
+
 @allow_non_gpu('ProjectExec', 'Alias', 'InputFileName', 'InputFileBlockStart', 'InputFileBlockLength',
                'FilterExec', 'And', 'IsNotNull', 'GreaterThan', 'Literal',
                'FileSourceScanExec', 'ColumnarToRowExec',

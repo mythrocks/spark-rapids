@@ -22,6 +22,7 @@ import ai.rapids.cudf.{ContiguousTable, Cuda, DeviceMemoryBuffer, HostMemoryBuff
 import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
 import com.nvidia.spark.rapids.RapidsPluginImplicits._
 import com.nvidia.spark.rapids.RmmRapidsRetryIterator.withRetryNoSplit
+import com.nvidia.spark.rapids.jni.GpuSplitAndRetryOOM
 import com.nvidia.spark.rapids.jni.kudo.KudoGpuSerializer
 
 import org.apache.spark.TaskContext
@@ -218,10 +219,12 @@ trait GpuPartitioning extends Partitioning {
           // This bound keeps the later Long->Int narrowings lossless:
           // offsetsHost.getLong(..).toInt and dataHost.getLength.toInt
           // (dataHost is sized to data.getLength).
-          require(data.getLength <= maxGpuSerializedSliceBytes,
-            s"GPU-serialized shuffle batch is ${data.getLength} bytes, exceeding the " +
-            s"$maxGpuSerializedSliceBytes-byte (2GB) limit addressable by the Int " +
-            s"serialized-slice offsets; reduce spark.rapids.sql.batchSizeBytes")
+          if (data.getLength > maxGpuSerializedSliceBytes) {
+            // Retryable: the exchange splits its input batch in half and partitions each half.
+            throw new GpuSplitAndRetryOOM(s"GPU-serialized shuffle batch is " +
+              s"${data.getLength} bytes, exceeding the $maxGpuSerializedSliceBytes-byte (2GB) " +
+              s"limit addressable by the Int serialized-slice offsets")
+          }
           closeOnExcept(Seq(HostMemoryBuffer.allocate(data.getLength),
             HostMemoryBuffer.allocate(offsets.getLength))) { seq =>
             val dataHost = seq(0)
@@ -270,7 +273,12 @@ trait GpuPartitioning extends Partitioning {
   }
 
   def sliceInternalGpuOrCpuAndClose(numRows: Int, partitionIndexes: Array[Int],
-      partitionColumns: Array[GpuColumnVector]): Array[(ColumnarBatch, Int)] = {
+      inputColumns: Array[GpuColumnVector]): Array[(ColumnarBatch, Int)] = {
+    // No shuffle serializer or reduce side accepts the DICTIONARY32 columns input_file_name()
+    // can produce (see InputFileNameDictionaryRule), and the GPU shuffle would hand them across
+    // the exchange as they are. This runs inside the exchange's split-and-retry, so a decode
+    // that overflows the column size limit splits the batch.
+    val partitionColumns = DictionaryDecode.decodeAndClose(inputColumns)
     // Both GPU slicers build a cuDF Table, which cannot hold a rows-only batch. The CPU
     // slicer cuts one by row count, and every shuffle writer accepts its zero-column slices.
     val rowsOnly = partitionColumns.isEmpty

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021-2025, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2021-2026, NVIDIA CORPORATION. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -610,10 +610,8 @@ class JoinGathererImpl(
 
   override def getBitSizeMap(n: Int): ColumnView = {
     val cb = data.getBatch
-    val inputBitCounts = withResource(GpuColumnVector.from(cb)) { table =>
-      withResource(table.rowBitCount()) { bits =>
-        bits.castTo(DType.INT64)
-      }
+    val inputBitCounts = withResource(DictionaryDecode.rowBitCount(cb)) { bits =>
+      bits.castTo(DType.INT64)
     }
     // Gather the bit counts so we know what the output table will look like
     val gatheredBitCount = withResource(inputBitCounts) { inputBitCounts =>
@@ -710,10 +708,8 @@ class JoinGathererSameTable(
 
   override def getBitSizeMap(n: Int): ColumnView = {
     withResource(sliceForGather(n)) { cb =>
-      withResource(GpuColumnVector.from(cb)) { table =>
-        withResource(table.rowBitCount()) { bits =>
-          bits.castTo(DType.INT64)
-        }
+      withResource(DictionaryDecode.rowBitCount(cb)) { bits =>
+        bits.castTo(DType.INT64)
       }
     }
   }

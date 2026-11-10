@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023-2025, NVIDIA CORPORATION.
+ * Copyright (c) 2023-2026, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@
 
 package com.nvidia.spark.rapids.delta
 
-import com.nvidia.spark.rapids.{BaseExprMeta, DataFromReplacementRule, DataWritingCommandMeta, GpuExec, GpuMetric, GpuOverrides, PartMeta, RapidsConf, RapidsMeta, ScanMeta, SparkPlanMeta}
+import com.nvidia.spark.rapids.{BaseExprMeta, DataFromReplacementRule, DataWritingCommandMeta, GpuBatchPassThroughExec, GpuExec, GpuMetric, GpuOverrides, PartMeta, RapidsConf, RapidsMeta, ScanMeta, SparkPlanMeta}
 
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
@@ -102,7 +102,7 @@ case class RapidsDeltaWriteExec(child: SparkPlan) extends V2CommandExec with Una
  * of the InsertAdaptiveSparkPlan Rule in Spark for details.
  */
 case class GpuRapidsDeltaWriteExec(child: SparkPlan) extends V2CommandExec
-    with UnaryExecNode with GpuExec {
+    with UnaryExecNode with GpuExec with GpuBatchPassThroughExec {
   override def output: Seq[Attribute] = child.output
 
   lazy val basicMetrics: Map[String, GpuMetric] = GpuWriteJobStatsTracker.basicMetrics

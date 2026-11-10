@@ -16,10 +16,21 @@
 
 package com.nvidia.spark.rapids
 
+import ai.rapids.cudf.DType
+import com.nvidia.spark.rapids.Arm.withResource
+import com.nvidia.spark.rapids.RapidsPluginImplicits._
+
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, AttributeSet, NamedExpression}
+import org.apache.spark.sql.catalyst.expressions.aggregate.Partial
+import org.apache.spark.sql.catalyst.plans.{Inner, JoinType, LeftAnti, LeftOuter, LeftSemi, RightOuter}
+import org.apache.spark.sql.catalyst.plans.ExistenceJoin
+import org.apache.spark.sql.catalyst.plans.physical.RangePartitioning
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.rapids.{GpuInputFileName, GpuInsertIntoHadoopFsRelationCommand, GpuOrcFileFormat}
+import org.apache.spark.sql.rapids.aggregate.{GpuAggregateFunction, GpuCount, GpuFirst, GpuLast, GpuMax, GpuMin}
+import org.apache.spark.sql.rapids.execution.{GpuBroadcastHashJoinExecBase, GpuShuffleExchangeExecBase}
 import org.apache.spark.sql.types.StringType
+import org.apache.spark.sql.vectorized.ColumnarBatch
 
 /**
  * A unary GPU expression that, given a StringType child backed by a STRING-keyed DICTIONARY32
@@ -28,6 +39,12 @@ import org.apache.spark.sql.types.StringType
  * dictionary-backed input_file_name() column flow through such an expression.
  */
 trait GpuStringDictionaryPassThrough
+
+/**
+ * A unary GPU exec whose columnar output is its child's batches, unchanged.
+ * InputFileNameDictionaryRule passes dictionary-backed input_file_name() columns through it.
+ */
+trait GpuBatchPassThroughExec
 
 /**
  * Decides, for each `input_file_name()` in the plan, whether GpuInputFileName returns a
@@ -48,10 +65,17 @@ trait GpuStringDictionaryPassThrough
  *  - GpuDataWritingCommandExec for an unpartitioned, unbucketed Parquet or ORC insert (see
  *    writesDecodedDictionaries), through the GpuWriteFilesLike node of planned writes.
  *    ColumnarOutputWriter decodes dictionaries inside a split-and-retry block before encoding.
+ *  - GpuShuffleExchangeExecBase, except for range-partitioning keys. GpuPartitioning decodes
+ *    dictionaries inside the exchange's split-and-retry block before slicing, so no serializer,
+ *    no reduce side and no other query stage sees one.
+ *  - A partial GpuHashAggregateExec (see aggregateAllowed), for grouping keys and the inputs of
+ *    grouped count/min/max/first/last.
+ *  - GpuBroadcastHashJoinExecBase (see streamSideAllowed), for stream-side columns that are
+ *    not join keys or in the condition.
  *  - GpuProjectExec, for columns it passes through unchanged (possibly aliased or wrapped in a
  *    GpuStringDictionaryPassThrough expression).
  *  - GpuFilterExec, for columns its condition does not reference.
- *  - GpuCoalesceBatches, GpuLocalLimitExec and GpuGlobalLimitExec.
+ *  - GpuCoalesceBatches, GpuLocalLimitExec, GpuGlobalLimitExec and GpuBatchPassThroughExec.
  *
  * The rule decides both ways, so applying it again to a re-optimized plan is safe.
  */
@@ -77,6 +101,24 @@ object InputFileNameDictionaryRule {
           rewrite(query, query.outputSet)
       }
       write.withNewChildren(Seq(newChild))
+    case exchange: GpuShuffleExchangeExecBase =>
+      // GpuRangePartitioner compares the range keys with STRING bounds before the decode.
+      val rangeKeys = exchange.outputPartitioning match {
+        case range: RangePartitioning => range.references
+        case _ => AttributeSet.empty
+      }
+      exchange.withNewChildren(Seq(rewrite(exchange.child, exchange.child.outputSet -- rangeKeys)))
+    case agg: GpuHashAggregateExec =>
+      agg.withNewChildren(Seq(rewrite(agg.child, aggregateAllowed(agg, allowed))))
+    case join: GpuBroadcastHashJoinExecBase =>
+      val streamAllowed = streamSideAllowed(join, allowed)
+      val (newLeft, newRight) = join.buildSide match {
+        case GpuBuildRight =>
+          (rewrite(join.left, streamAllowed), rewrite(join.right, AttributeSet.empty))
+        case GpuBuildLeft =>
+          (rewrite(join.left, AttributeSet.empty), rewrite(join.right, streamAllowed))
+      }
+      join.withNewChildren(Seq(newLeft, newRight))
     case project: GpuProjectExec =>
       rewriteProject(project, allowed)
     case filter: GpuFilterExec =>
@@ -87,6 +129,8 @@ object InputFileNameDictionaryRule {
       limit.withNewChildren(Seq(rewrite(limit.child, allowed)))
     case limit: GpuGlobalLimitExec =>
       limit.withNewChildren(Seq(rewrite(limit.child, allowed)))
+    case passThrough if passThrough.isInstanceOf[GpuBatchPassThroughExec] =>
+      passThrough.withNewChildren(passThrough.children.map(rewrite(_, allowed)))
     case other =>
       other.withNewChildren(other.children.map(rewrite(_, AttributeSet.empty)))
   }
@@ -106,6 +150,99 @@ object InputFileNameDictionaryRule {
           insert.fileFormat.isInstanceOf[GpuOrcFileFormat])
     case _ => false
   }
+
+  /**
+   * The child columns of a hash aggregate that may be dictionaries, given the aggregate's output
+   * columns its parent accepts as dictionaries.
+   *
+   * Only a partial aggregate whose whole output is accepted qualifies (in practice, one below a
+   * shuffle exchange, which decodes). libcudf groupby compares and hashes dictionary keys by
+   * value, and returns grouping keys and min/max/first/last values as dictionaries, which then
+   * reach the exchange. A column qualifies when it is used only as a bare grouping key or as the
+   * direct input of count, or of min/max/first/last with grouping keys: their reductions throw on
+   * a dictionary.
+   *
+   * When the single-pass sort path may run, grouping keys are excluded: GpuOutOfCoreSortIterator
+   * compares the sorted batch's keys with a STRING cutoff, which throws on a dictionary key.
+   * Values are only sort payload there, and the cutoff comparison reads keys only.
+   */
+  private def aggregateAllowed(agg: GpuHashAggregateExec, allowed: AttributeSet): AttributeSet = {
+    val partial = agg.requiredChildDistributionExpressions.isEmpty &&
+      agg.aggregateExpressions.forall(_.mode == Partial)
+    if (!partial || !agg.output.forall(allowed.contains)) {
+      AttributeSet.empty
+    } else {
+      val grouped = agg.groupingExpressions.nonEmpty
+      val mayRunSorted = agg.allowSinglePassAgg || agg.forceSinglePassAgg
+      val (keys, otherGrouping) = agg.groupingExpressions.partition { key =>
+        !mayRunSorted && key.isInstanceOf[AttributeReference]
+      }
+      val inputs = agg.aggregateExpressions.map { e =>
+        if (e.isDistinct || e.filter.isDefined) {
+          None
+        } else {
+          dictionaryInput(e.aggregateFunction, grouped)
+        }
+      }
+      val otherAggregates = agg.aggregateExpressions.zip(inputs).collect {
+        case (e, None) => e
+      }
+      val otherReferences = AttributeSet(
+        otherGrouping.flatMap(_.references) ++ otherAggregates.flatMap(_.references))
+      AttributeSet(keys.map(_.toAttribute) ++ inputs.flatten) -- otherReferences
+    }
+  }
+
+  /** The column an aggregate function reads directly, if it returns a dictionary unchanged. */
+  private def dictionaryInput(
+      function: GpuAggregateFunction,
+      grouped: Boolean): Option[Attribute] = {
+    val accepts = function match {
+      case _: GpuCount => true
+      case _: GpuMin | _: GpuMax | _: GpuFirst | _: GpuLast => grouped
+      case _ => false
+    }
+    function.children match {
+      case Seq(attr: AttributeReference) if accepts => Some(attr)
+      case _ => None
+    }
+  }
+
+  /**
+   * The stream-side columns of a broadcast hash join that may be dictionaries. A stream-side
+   * column is gathered unchanged into the output, and libcudf gathers dictionaries.
+   * JoinGatherer sizes the output with DictionaryDecode.rowBitCount, which handles dictionaries.
+   * Excluded:
+   *  - join keys: libcudf throws on a dictionary key against a STRING key;
+   *  - condition columns: AST conditions compare dictionary indices, and other conditions run
+   *    string expressions;
+   *  - join types that null-fill or empty the stream side (FullOuter, LeftOuter building left,
+   *    RightOuter building right): the join builds those columns as STRING from the Spark type,
+   *    and a later concatenate rejects a mix of STRING and dictionary batches.
+   */
+  private def streamSideAllowed(
+      join: GpuBroadcastHashJoinExecBase,
+      allowed: AttributeSet): AttributeSet = {
+    val stream = join.buildSide match {
+      case GpuBuildRight => join.left
+      case GpuBuildLeft => join.right
+    }
+    if (!keepsStreamColumns(join.joinType, join.buildSide)) {
+      AttributeSet.empty
+    } else {
+      val usedByJoin = AttributeSet((join.leftKeys ++ join.rightKeys ++ join.condition.toSeq)
+        .flatMap(_.references))
+      AttributeSet(stream.output.filter(allowed.contains)) -- usedByJoin
+    }
+  }
+
+  private def keepsStreamColumns(joinType: JoinType, buildSide: GpuBuildSide): Boolean =
+    joinType match {
+      case Inner | LeftSemi | LeftAnti | ExistenceJoin(_) => true
+      case LeftOuter => buildSide == GpuBuildRight
+      case RightOuter => buildSide == GpuBuildLeft
+      case _ => false
+    }
 
   private def rewriteProject(project: GpuProjectExec, allowed: AttributeSet): SparkPlan = {
     val newProjectList = project.projectList.map {
@@ -155,5 +292,73 @@ object InputFileNameDictionaryRule {
         case _ => None
       }
     case _ => None
+  }
+}
+
+/**
+ * Decoding of the DICTIONARY32 columns that input_file_name() can produce (see
+ * InputFileNameDictionaryRule), for the operators that accept a dictionary only to turn it
+ * back into STRING.
+ */
+object DictionaryDecode {
+
+  def hasDictionary(columns: Seq[GpuColumnVector]): Boolean =
+    columns.exists(_.getBase.getType.equals(DType.DICTIONARY32))
+
+  /** Replaces each DICTIONARY32 column with its decoded STRING column. Closes the input. */
+  def decodeAndClose(columns: Array[GpuColumnVector]): Array[GpuColumnVector] = {
+    if (!hasDictionary(columns)) {
+      columns
+    } else {
+      withResource(columns) { _ =>
+        columns.safeMap { column =>
+          if (column.getBase.getType.equals(DType.DICTIONARY32)) {
+            GpuColumnVector.from(column.getBase.dictionaryDecode(), column.dataType())
+          } else {
+            column.incRefCount()
+          }
+        }
+      }
+    }
+  }
+
+  /** Replaces each DICTIONARY32 column of a batch with its decoded STRING column. */
+  def decodeAndClose(batch: ColumnarBatch): ColumnarBatch = {
+    val columns = GpuColumnVector.extractColumns(batch)
+    if (!hasDictionary(columns)) {
+      batch
+    } else {
+      val numRows = batch.numRows()
+      val decoded = withResource(batch) { _ =>
+        decodeAndClose(columns.map(_.incRefCount()))
+      }
+      new ColumnarBatch(decoded.toArray[org.apache.spark.sql.vectorized.ColumnVector], numRows)
+    }
+  }
+
+  /**
+   * Table.rowBitCount for a batch that may hold DICTIONARY32 columns, which libcudf's
+   * row_bit_count rejects. A dictionary counts as its indices: a gather keeps it a dictionary,
+   * so that is what each row adds to the output.
+   */
+  def rowBitCount(batch: ColumnarBatch): ai.rapids.cudf.ColumnVector = {
+    val columns = GpuColumnVector.extractBases(batch)
+    if (!columns.exists(_.getType.equals(DType.DICTIONARY32))) {
+      withResource(GpuColumnVector.from(batch))(_.rowBitCount())
+    } else {
+      val counted = columns.safeMap { column =>
+        if (!column.getType.equals(DType.DICTIONARY32)) {
+          column.incRefCount()
+        } else if (column.getNumChildren == 0) {
+          // An empty dictionary may have no children.
+          ai.rapids.cudf.ColumnVector.fromInts()
+        } else {
+          withResource(column.getDictionaryIndices)(_.copyToColumnVector())
+        }
+      }
+      withResource(counted) { _ =>
+        withResource(new ai.rapids.cudf.Table(counted: _*))(_.rowBitCount())
+      }
+    }
   }
 }

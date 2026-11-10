@@ -24,14 +24,17 @@ import com.nvidia.spark.rapids.Arm.withResource
 import org.apache.spark.SparkConf
 import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.apache.spark.sql.execution.SparkPlan
-import org.apache.spark.sql.functions.{col, input_file_name, substring_index}
+import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
+import org.apache.spark.sql.functions.{broadcast, col, collect_set, count, first, input_file_name, max, min, sort_array, substring_index}
 import org.apache.spark.sql.rapids.{ExecutionPlanCaptureCallback, GpuInputFileName}
 import org.apache.spark.sql.types.StringType
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
-class InputFileNameDictionarySuite extends SparkQueryCompareTestSuite {
+class InputFileNameDictionarySuite extends SparkQueryCompareTestSuite
+    with AdaptiveSparkPlanHelper {
 
   private val conf = new SparkConf().set("spark.sql.adaptive.enabled", "false")
+  private val aqeConf = new SparkConf().set("spark.sql.adaptive.enabled", "true")
 
   private def writeInput(path: File): Unit = withCpuSparkSession { spark =>
     spark.range(0, 30, 1, 3)
@@ -40,9 +43,9 @@ class InputFileNameDictionarySuite extends SparkQueryCompareTestSuite {
       .write.parquet(path.getCanonicalPath)
   }
 
-  /** The outputDictionary flag of every GpuInputFileName in an executed plan. */
+  /** The outputDictionary flag of every GpuInputFileName in an executed plan, AQE stages too. */
   private def encodings(plan: SparkPlan): Seq[Boolean] =
-    plan.flatMap(_.expressions.flatMap(_.collect {
+    flatMap(plan)(_.expressions.flatMap(_.collect {
       case f: GpuInputFileName => f.outputDictionary
     }))
 
@@ -50,15 +53,17 @@ class InputFileNameDictionarySuite extends SparkQueryCompareTestSuite {
    * Runs `query` on the CPU and on the GPU, checks the GPU plan's input_file_name encodings and
    * that both return the same rows.
    */
-  private def check(expectedEncodings: Seq[Boolean])(query: DataFrame => DataFrame): Unit = {
+  private def check(expectedEncodings: Seq[Boolean], sessionConf: SparkConf = conf)(
+      query: DataFrame => DataFrame): Unit = {
     withTempPath { path =>
       writeInput(path)
       def run(spark: SparkSession): (Seq[Boolean], Seq[String]) = {
         val df = query(spark.read.parquet(path.getCanonicalPath))
-        (encodings(df.queryExecution.executedPlan), df.collect().map(_.toString).sorted.toSeq)
+        val rows = df.collect().map(_.toString).sorted.toSeq
+        (encodings(df.queryExecution.executedPlan), rows)
       }
-      val (_, expected) = withCpuSparkSession(run, conf)
-      val (gpuEncodings, actual) = withGpuSparkSession(run, conf)
+      val (_, expected) = withCpuSparkSession(run, sessionConf)
+      val (gpuEncodings, actual) = withGpuSparkSession(run, sessionConf)
       assert(gpuEncodings == expectedEncodings)
       assert(actual == expected)
     }
@@ -133,9 +138,126 @@ class InputFileNameDictionarySuite extends SparkQueryCompareTestSuite {
     }
   }
 
-  test("string when input_file_name() is aggregated") {
+  // 3a: the exchange decodes before slicing, so it accepts every column except range keys.
+  Seq(
+    "hash on another column" -> ((df: DataFrame) => df.repartition(4, col("a"))),
+    "hash on input_file_name()" -> ((df: DataFrame) => df.repartition(4, col("f"))),
+    "round robin" -> ((df: DataFrame) => df.repartition(3)),
+    "single partition" -> ((df: DataFrame) => df.repartition(1)),
+    "range on another column" -> ((df: DataFrame) => df.repartitionByRange(3, col("a")))
+  ).foreach { case (name, repartition) =>
+    test(s"dictionary through a shuffle, $name") {
+      check(Seq(true)) { df =>
+        repartition(df.select(col("a"), col("c"), input_file_name().as("f")))
+      }
+    }
+  }
+
+  test("dictionary through a shuffle with AQE") {
+    check(Seq(true), aqeConf) { df =>
+      df.select(col("a"), input_file_name().as("f")).repartition(4, col("f"))
+    }
+  }
+
+  test("dictionary through a one-column round-robin shuffle") {
+    check(Seq(true)) { df =>
+      df.select(input_file_name().as("f")).repartition(3)
+    }
+  }
+
+  test("string when a shuffle is range-partitioned by input_file_name()") {
     check(Seq(false)) { df =>
+      df.select(col("a"), input_file_name().as("f")).repartitionByRange(3, col("f"))
+    }
+  }
+
+  // 3b: partial aggregates group by and reduce dictionaries; the exchange above decodes.
+  test("dictionary as a grouping key of a partial aggregate") {
+    val hashOnly = conf.clone().set(RapidsConf.ENABLE_SINGLE_PASS_PARTIAL_SORT_AGG.key, "false")
+    check(Seq(true), hashOnly) { df =>
       df.select(col("a"), input_file_name().as("f")).groupBy("f").count()
+    }
+  }
+
+  test("string as a grouping key when the partial aggregate may sort") {
+    // A small batch size makes the out-of-core sort compare against a cutoff row.
+    val sorted = conf.clone()
+      .set(RapidsConf.FORCE_SINGLE_PASS_PARTIAL_SORT_AGG.key, "true")
+      .set(RapidsConf.GPU_BATCH_SIZE_BYTES.key, "1024")
+    check(Seq(false), sorted) { df =>
+      df.select(col("a"), input_file_name().as("f")).groupBy("f").count()
+    }
+  }
+
+  Seq(false, true).foreach { aqe =>
+    test(s"dictionary through distinct, AQE $aqe") {
+      check(Seq(true), if (aqe) aqeConf else conf) { df =>
+        df.select(input_file_name().as("f")).distinct()
+      }
+    }
+  }
+
+  test("dictionary as the input of grouped count, min, max and first") {
+    check(Seq(true)) { df =>
+      df.select(col("a"), input_file_name().as("f")).groupBy("a")
+        .agg(count(col("f")), min(col("f")), max(col("f")), first(col("f"), ignoreNulls = true))
+    }
+  }
+
+  test("dictionary as a value when the partial aggregate sorts by another key") {
+    val sorted = conf.clone()
+      .set(RapidsConf.FORCE_SINGLE_PASS_PARTIAL_SORT_AGG.key, "true")
+      .set(RapidsConf.GPU_BATCH_SIZE_BYTES.key, "1024")
+    check(Seq(true), sorted) { df =>
+      df.select(col("a"), input_file_name().as("f")).groupBy("a")
+        .agg(first(col("f"), ignoreNulls = true), max(col("f")))
+    }
+  }
+
+  test("string for an ungrouped min of input_file_name()") {
+    check(Seq(false)) { df =>
+      df.select(input_file_name().as("f")).agg(min(col("f")))
+    }
+  }
+
+  test("string for collect_set of input_file_name()") {
+    check(Seq(false)) { df =>
+      df.select(col("d"), input_file_name().as("f")).groupBy("d")
+        .agg(sort_array(collect_set(col("f"))))
+    }
+  }
+
+  // 3c: broadcast hash joins gather stream-side dictionaries.
+  private def broadcastKeys(df: DataFrame): DataFrame =
+    broadcast(df.sparkSession.range(0, 30, 2).selectExpr("id AS a", "id * 10 AS g"))
+
+  Seq("inner", "left_outer", "left_semi", "left_anti").foreach { joinType =>
+    test(s"dictionary on the stream side of a broadcast $joinType join") {
+      check(Seq(true)) { df =>
+        df.select(col("a"), input_file_name().as("f")).join(broadcastKeys(df), Seq("a"), joinType)
+      }
+    }
+  }
+
+  test("dictionary on the stream side of a broadcast join with a large gather") {
+    // A tiny batch-size target makes JoinGatherer size its output with rowBitCount.
+    check(Seq(true), conf.clone().set(RapidsConf.GPU_BATCH_SIZE_BYTES.key, "1024")) { df =>
+      df.select(col("a"), col("c"), input_file_name().as("f")).join(broadcastKeys(df), Seq("a"))
+    }
+  }
+
+  test("string when input_file_name() is a broadcast join key") {
+    check(Seq(false, false)) { df =>
+      df.select(col("a"), input_file_name().as("f"))
+        .join(broadcast(df.select(input_file_name().as("f"))), Seq("f"))
+    }
+  }
+
+  test("string when a broadcast join condition reads input_file_name()") {
+    check(Seq(false)) { df =>
+      val keys = broadcastKeys(df)
+      val left = df.select(col("a"), input_file_name().as("f"))
+      left.join(keys, left("a") === keys("a") && left("f").contains(keys("g").cast("string")))
     }
   }
 

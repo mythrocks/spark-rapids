@@ -21,7 +21,7 @@ import java.math.RoundingMode
 import ai.rapids.cudf.{ColumnVector, Cuda, DType, Scalar, Table}
 import com.nvidia.spark.rapids.Arm.withResource
 import com.nvidia.spark.rapids.RapidsConf.ShuffleKudoMode
-import com.nvidia.spark.rapids.jni.RmmSpark
+import com.nvidia.spark.rapids.jni.{GpuSplitAndRetryOOM, RmmSpark}
 import com.nvidia.spark.rapids.shims.GpuHashPartitioning
 import org.scalatest.BeforeAndAfterEach
 import org.scalatest.funsuite.AnyFunSuite
@@ -189,7 +189,7 @@ class GpuPartitioningSuite extends AnyFunSuite with BeforeAndAfterEach {
     }
   }
 
-  test("GPU kudo partitioning rejects oversized serialized batch") {
+  test("GPU kudo partitioning asks to split an oversized serialized batch") {
     TrampolineUtil.cleanupAnyExistingSession()
     val conf = new SparkConf()
         .set(RapidsConf.SHUFFLE_COMPRESSION_CODEC.key, "none")
@@ -206,11 +206,11 @@ class GpuPartitioningSuite extends AnyFunSuite with BeforeAndAfterEach {
         GpuColumnVector.incRefCounts(batch)
         val columns = GpuColumnVector.extractColumns(batch)
         val numRows = batch.numRows
-        val ex = intercept[IllegalArgumentException] {
+        // The exchange's withRetry(splitSpillableInHalfByRows) splits the input on this.
+        val ex = intercept[GpuSplitAndRetryOOM] {
           gp.sliceInternalGpuOrCpuAndClose(numRows, partitionIndices, columns)
         }
         assert(ex.getMessage.contains("exceeding the"))
-        assert(ex.getMessage.contains("reduce spark.rapids.sql.batchSizeBytes"))
       }
     }
   }
